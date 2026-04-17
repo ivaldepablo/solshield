@@ -219,11 +219,18 @@ function TopBar() {
       </div>
       <div className="flex items-center gap-3 sm:gap-4 text-[11px] tracking-[0.2em] uppercase">
         <a
+          href="/real-test"
+          className="text-neon-green hover:text-neon-green/80 transition-colors font-bold border border-neon-green/50 px-2 py-0.5"
+          title="real phishing URLs + real dapp tests"
+        >
+          [ test it real ]
+        </a>
+        <a
           href="/demo"
-          className="text-neon-red hover:text-neon-red/80 transition-colors font-bold animate-pulse-glow border border-neon-red/50 px-2 py-0.5"
+          className="text-neon-red hover:text-neon-red/80 transition-colors font-bold animate-pulse-glow border border-neon-red/50 px-2 py-0.5 hidden sm:inline-block"
           title="watch the extension catch a fake airdrop drainer"
         >
-          [ ▶ live demo ]
+          [ ▶ demo ]
         </a>
         <a
           href="/lab"
