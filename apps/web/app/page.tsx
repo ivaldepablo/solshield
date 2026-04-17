@@ -219,8 +219,15 @@ function TopBar() {
       </div>
       <div className="flex items-center gap-3 sm:gap-4 text-[11px] tracking-[0.2em] uppercase">
         <a
+          href="/diagnostic"
+          className="text-neon-cyan hover:text-neon-cyan/80 transition-colors font-bold border border-neon-cyan/50 px-2 py-0.5"
+          title="verify the extension is hooked correctly"
+        >
+          [ ✓ diagnostic ]
+        </a>
+        <a
           href="/real-test"
-          className="text-neon-green hover:text-neon-green/80 transition-colors font-bold border border-neon-green/50 px-2 py-0.5"
+          className="text-neon-green hover:text-neon-green/80 transition-colors font-bold border border-neon-green/50 px-2 py-0.5 hidden sm:inline-block"
           title="real phishing URLs + real dapp tests"
         >
           [ test it real ]

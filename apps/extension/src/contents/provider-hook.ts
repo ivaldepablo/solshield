@@ -2,6 +2,14 @@
  * Injected into MAIN world at document_start.
  * Patches window.solana, window.phantom.solana, window.solflare to intercept
  * signTransaction, signAllTransactions, and signMessage before the wallet sees them.
+ *
+ * v0.1.2: hooks are now "sticky" via Object.defineProperty getters — even if a
+ * dapp / SDK (Dynamic, Privy, ...) tries to overwrite our wrapper after we install
+ * it, the setter re-wraps the new value. Plus a postMessage interceptor as a
+ * catch-all safety net for wallet bridges that bypass the JS API entirely.
+ *
+ * Diagnostic state is exposed at `window.__solshield` so the /diagnostic page
+ * (and curious devs) can introspect what's hooked in real time.
  */
 
 import type { PlasmoCSConfig } from 'plasmo';
@@ -13,6 +21,69 @@ export const config: PlasmoCSConfig = {
   world: 'MAIN',
   run_at: 'document_start',
 };
+
+const SOLSHIELD_VERSION = '0.1.2';
+
+interface SolShieldStatus {
+  version: string;
+  installedAt: number;
+  hooks: {
+    legacyWindowSolana: boolean;
+    legacyPhantom: boolean;
+    legacySolflare: boolean;
+    walletStandardWallets: number;
+    postMessageInterceptor: boolean;
+  };
+  interceptions: {
+    /** counter — total signing requests we caught and analyzed */
+    total: number;
+    /** counter — analyses that came back as safe */
+    safe: number;
+    /** counter — verdicts that triggered the overlay (suspicious + danger) */
+    flagged: number;
+    /** counter — calls where we failed open (API down, timeout, etc.) */
+    failedOpen: number;
+    /** the most recent intercepted call, useful for the diagnostic page */
+    last: {
+      at: number;
+      kind: 'tx' | 'msg' | 'wallet-standard-msg' | 'wallet-standard-tx' | 'wallet-standard-signin';
+      verdict: 'safe' | 'suspicious' | 'danger' | 'failed-open' | 'unknown';
+    } | null;
+  };
+}
+
+function ensureStatus(): SolShieldStatus {
+  const w = window as unknown as { __solshield?: SolShieldStatus };
+  if (!w.__solshield) {
+    w.__solshield = {
+      version: SOLSHIELD_VERSION,
+      installedAt: Date.now(),
+      hooks: {
+        legacyWindowSolana: false,
+        legacyPhantom: false,
+        legacySolflare: false,
+        walletStandardWallets: 0,
+        postMessageInterceptor: false,
+      },
+      interceptions: { total: 0, safe: 0, flagged: 0, failedOpen: 0, last: null },
+    };
+  }
+  return w.__solshield;
+}
+
+function recordInterception(
+  kind: SolShieldStatus['interceptions']['last'] extends { kind: infer K } | null ? K : never,
+  verdict: SolShieldStatus['interceptions']['last'] extends { verdict: infer V } | null ? V : never,
+): void {
+  const status = ensureStatus();
+  status.interceptions.total++;
+  if (verdict === 'safe') status.interceptions.safe++;
+  else if (verdict === 'failed-open') status.interceptions.failedOpen++;
+  else if (verdict === 'suspicious' || verdict === 'danger') status.interceptions.flagged++;
+  status.interceptions.last = { at: Date.now(), kind, verdict };
+}
+
+ensureStatus(); // always create the status object at script load
 
 // Global map to correlate requests with responses
 const pendingRequests = new Map<
@@ -269,25 +340,51 @@ function createProxyFn(
 }
 
 /**
- * Patch a provider object's signing methods.
+ * Install a "sticky" wrapped method on a provider — even if the dapp / SDK
+ * later tries to reassign the property, our setter re-wraps the new value.
+ * This is what defeats Dynamic / Privy / Reown style abstraction layers that
+ * cache and replace wallet methods at connection time.
  */
-function patchProvider(provider: Record<string, unknown>): void {
-  if (typeof provider.signTransaction === 'function') {
-    const original = provider.signTransaction as (...args: unknown[]) => unknown;
-    provider.signTransaction = createProxyFn(original, 'signTransaction');
-  }
+function installStickyProxy(
+  provider: Record<string, unknown>,
+  methodName: 'signTransaction' | 'signAllTransactions' | 'signMessage',
+): void {
+  const original = provider[methodName];
+  if (typeof original !== 'function') return;
 
-  if (typeof provider.signAllTransactions === 'function') {
-    const original = provider.signAllTransactions as (
-      ...args: unknown[]
-    ) => unknown;
-    provider.signAllTransactions = createProxyFn(original, 'signAllTransactions');
-  }
+  let wrapped = createProxyFn(original as (...args: unknown[]) => unknown, methodName);
 
-  if (typeof provider.signMessage === 'function') {
-    const original = provider.signMessage as (...args: unknown[]) => unknown;
-    provider.signMessage = createProxyFn(original, 'signMessage');
+  try {
+    Object.defineProperty(provider, methodName, {
+      configurable: true,
+      enumerable: true,
+      get: () => wrapped,
+      set: (newValue: unknown) => {
+        // Someone (likely Dynamic / Privy) is trying to swap our wrapper out.
+        // Wrap the new function and keep them happy.
+        if (typeof newValue === 'function') {
+          wrapped = createProxyFn(newValue as (...args: unknown[]) => unknown, methodName);
+        } else {
+          wrapped = newValue as never;
+        }
+      },
+    });
+  } catch {
+    // Property is non-configurable for some reason — fall back to direct assignment.
+    provider[methodName] = wrapped;
   }
+}
+
+/** Patch a provider object's signing methods (wallet-standard-agnostic legacy hook). */
+function patchProvider(provider: Record<string, unknown>, label: string): void {
+  installStickyProxy(provider, 'signTransaction');
+  installStickyProxy(provider, 'signAllTransactions');
+  installStickyProxy(provider, 'signMessage');
+
+  const status = ensureStatus();
+  if (label === 'window.solana') status.hooks.legacyWindowSolana = true;
+  else if (label === 'phantom.solana') status.hooks.legacyPhantom = true;
+  else if (label === 'solflare') status.hooks.legacySolflare = true;
 }
 
 /**
@@ -302,7 +399,7 @@ function initProviderPatching(): void {
 
     // Check window.solana (legacy)
     if (w.solana && typeof w.solana === 'object') {
-      patchProvider(w.solana as Record<string, unknown>);
+      patchProvider(w.solana as Record<string, unknown>, 'window.solana');
     }
 
     // Check window.phantom.solana
@@ -313,16 +410,14 @@ function initProviderPatching(): void {
       typeof (w.phantom as Record<string, unknown>).solana === 'object'
     ) {
       patchProvider(
-        (w.phantom as Record<string, unknown>).solana as Record<
-          string,
-          unknown
-        >
+        (w.phantom as Record<string, unknown>).solana as Record<string, unknown>,
+        'phantom.solana',
       );
     }
 
     // Check window.solflare
     if (w.solflare && typeof w.solflare === 'object') {
-      patchProvider(w.solflare as Record<string, unknown>);
+      patchProvider(w.solflare as Record<string, unknown>, 'solflare');
     }
 
     attempts++;
@@ -480,6 +575,8 @@ function wrapWalletStandardWallet(wallet: WalletStandardWallet): void {
     'tx',
   );
   wrapWalletStandardMethod(features['solana:signIn'], 'signIn', 'msg');
+
+  ensureStatus().hooks.walletStandardWallets++;
 }
 
 function setupWalletStandardHook(): void {
@@ -535,8 +632,67 @@ function setupWalletStandardHook(): void {
   }, 500);
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * postMessage safety net
+ *
+ * Some wallet abstraction SDKs (Dynamic, Privy, Reown) cache method
+ * references at app load time and call them directly later — bypassing
+ * our defineProperty getters. As a final layer, we hook window.postMessage
+ * and detect signing requests by shape (regardless of who's sending them).
+ *
+ * This is a "best effort" interceptor and currently logs to
+ * window.__solshield.interceptions for diagnostics. Production-blocking
+ * via this path is risky (wallets use a confirm/response handshake we'd
+ * have to fake), so for now we use it to surface bypass cases on the
+ * /diagnostic page.
+ * ────────────────────────────────────────────────────────────────── */
+
+function setupPostMessageInterceptor(): void {
+  const original = window.postMessage.bind(window);
+  let installed = false;
+
+  try {
+    Object.defineProperty(window, 'postMessage', {
+      configurable: true,
+      writable: true,
+      value: function (this: Window, message: unknown, ...rest: unknown[]) {
+        // Inspect by shape — common wallet bridge patterns include a `method`
+        // field with 'signMessage' / 'signTransaction' / 'sign'.
+        if (message && typeof message === 'object') {
+          const msg = message as Record<string, unknown>;
+          const candidate =
+            (typeof msg.method === 'string' ? msg.method : undefined) ||
+            (typeof msg.type === 'string' ? msg.type : undefined) ||
+            '';
+          if (/sign(transaction|message|in|all)?/i.test(candidate)) {
+            // Just record — don't block (yet). The other hooks should have caught
+            // this. If they didn't, the diagnostic page will surface the gap.
+            const status = ensureStatus();
+            status.interceptions.total++;
+            status.interceptions.last = {
+              at: Date.now(),
+              kind: /transaction/i.test(candidate)
+                ? 'wallet-standard-tx'
+                : 'wallet-standard-msg',
+              verdict: 'unknown',
+            };
+          }
+        }
+        // pass through always
+        return original.call(window, message as never, ...(rest as []));
+      },
+    });
+    installed = true;
+  } catch {
+    // window.postMessage is locked down by SES on some pages — ignore.
+  }
+
+  ensureStatus().hooks.postMessageInterceptor = installed;
+}
+
 // Start patching when script loads
 initProviderPatching();
 setupWalletStandardHook();
+setupPostMessageInterceptor();
 
 export {};

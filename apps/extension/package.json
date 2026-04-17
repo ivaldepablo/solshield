@@ -1,7 +1,7 @@
 {
   "name": "@solshield/extension",
   "displayName": "SolShield — scan before you sign",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Open-source Solana wallet firewall. Blocks drainers, phishing and fake permits before you sign. Powered by Claude AI.",
   "author": "0xnullpavel",
   "homepage": "https://solshield.dev",
