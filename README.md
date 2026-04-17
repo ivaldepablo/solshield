@@ -22,7 +22,7 @@ typescript monorepo, pnpm workspaces.
 - `packages/sdk` — public client library (for wallets/dapps)
 - `apps/web` — next.js dashboard + live demo
 
-postgres + redis for runtime state, helius for solana data, anthropic (haiku/sonnet) for the ai layer. docker compose for local dev.
+postgres + redis for runtime state, helius for solana data. the ai layer runs on anthropic's latest models — **claude haiku 4.5** for fast classification and **claude opus 4.7** for deep threat analysis. docker compose for local dev.
 
 ## running it
 
@@ -44,7 +44,7 @@ blockaid and blowfish already do this but they're closed. solshield is the open 
 - [x] monorepo scaffold
 - [ ] tx parser + instruction decoder (`@solana/kit`)
 - [ ] static rules: drainer patterns, unlimited approvals, suspicious mints
-- [ ] ai layer with haiku 4.5 (fast classify) + sonnet 4.6 (deep analysis)
+- [ ] ai layer: haiku 4.5 (fast classify) + opus 4.7 (deep analysis)
 - [ ] `@solshield/sdk` published to npm
 - [ ] live demo on mainnet
 - [ ] wallet integrations (phantom, solflare, backpack)

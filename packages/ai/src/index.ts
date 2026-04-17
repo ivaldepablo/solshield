@@ -1,8 +1,11 @@
 import type { ThreatReport } from '@solshield/core';
 
+export type Model = 'haiku-4-5' | 'sonnet-4-6' | 'opus-4-7';
+
 export interface AnalyzerOptions {
   apiKey: string;
-  model?: 'haiku' | 'sonnet';
+  fastModel?: Model;
+  deepModel?: Model;
 }
 
 export interface Analyzer {
