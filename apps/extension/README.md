@@ -34,6 +34,33 @@ pnpm -F @solshield/extension dev
 
 Opens Chrome with the extension enabled. Changes auto-reload.
 
+## How to test it without a wallet
+
+Visit **https://solshield.dev/test-extension** with the extension loaded.
+
+The page mounts a fake `window.solana` provider so the SolShield content
+script has something to wrap. Four buttons:
+
+- **Sign in (spoofed jup.ag)** — sends a SIWS message claiming `jup.ag`
+  while the page origin is `solshield.dev`. Should show a critical red
+  overlay (`spoofed-siws-domain`).
+- **Authorize 1M USDC (permit)** — off-chain permit-shaped message,
+  high-severity overlay.
+- **Sign in (legit jup.ag)** — same domain in claim and origin, should
+  pass through (or show a small green badge).
+- **Sign a transaction** — exercises the tx hook with demo bytes
+  (extension fails open on undecodable bytes; useful to confirm the
+  proxy is in place).
+
+Click REJECT in the overlay → the wallet method throws a wallet-style
+4001 rejection error and the page logs it. Click PROCEED → the original
+mock function runs and returns a signature.
+
+To test the **domain-guard**, just open `https://jupitor-claim.io/` in
+a new tab — the extension's `document_start` script injects a full-page
+red warning before any content loads (the domain is in the embedded
+blocklist).
+
 ## Build
 
 ```bash
