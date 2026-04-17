@@ -1,58 +1,84 @@
-# solshield
+# SolShield
 
-open-source transaction firewall for solana. before a wallet asks the user to sign, solshield looks at the tx and decides if something's off.
+Pre-signature transaction analysis for Solana. Intercepts unsigned transactions, decides if they are safe to sign, and surfaces a verdict the wallet can render before the user approves.
 
-> early WIP. nothing is production ready. star to follow along.
+Blockaid and Blowfish already occupy this space. Both are closed, pay-walled, and scoped to what their vendors choose to cover. SolShield is the open reference implementation the ecosystem should have shipped two years ago.
 
-## what it does
+> Active development. Not production-ready. Public APIs and data schemas will break until 1.0.
 
-1. wallet sends us a serialized tx before prompting to sign
-2. we simulate it, run it through a rules engine, and ask a model for a second opinion
-3. we return a risk score + reason
-4. wallet renders a warning if the score is high enough
+## Threat model
 
-the pitch: turn "approve?" into "approve — we see this is probably a drainer, proceed anyway?"
+The wallet layer on Solana is thin. When the user clicks *approve*, the signature authorizes the requested operation with almost no in-context explanation. SolShield sits between the dApp and the signature, takes the serialized transaction, and answers a single question: **is this safe to sign?**
 
-## stack
+Inspection runs in four passes, cheap to expensive:
 
-typescript monorepo, pnpm workspaces.
+1. **Static analysis.** Instruction decoding, known-bad program IDs, unlimited-approval anti-patterns, silent mint/freeze authority swaps, squatted token metadata, CPI guard violations.
+2. **Dynamic simulation.** Execute against forked mainnet state. Diff balances, token ownership, and account authorities. Catch hidden transfers and delegated authority the static pass missed.
+3. **Heuristic and ML classification.** Claude Haiku 4.5 for triage, Claude Opus 4.7 for deep reasoning on ambiguous cases. Prompts, few-shots, and the curated threat corpus all live in-tree — nothing is hidden in a remote config.
+4. **Reputation.** Program, signer, and destination history via Helius and on-chain feeds.
 
-- `packages/core` — rule engine, tx parser, policy types
-- `packages/ai` — anthropic wrapper for threat analysis
-- `packages/sdk` — public client library (for wallets/dapps)
-- `apps/web` — next.js dashboard + live demo
+The output is bounded: a numerical risk score, a categorical verdict (`safe | suspicious | danger`), and a human-readable reason ready to drop into a wallet modal.
 
-postgres + redis for runtime state, helius for solana data. the ai layer runs on anthropic's latest models — **claude haiku 4.5** for fast classification and **claude opus 4.7** for deep threat analysis. docker compose for local dev.
+## Attack surface it covers
 
-## running it
+- Drainer programs and their obfuscated variants
+- Malicious token approvals and unlimited delegations
+- Hidden SOL/SPL transfers camouflaged inside legitimate-looking instructions
+- Authority swaps (mint, freeze, upgrade)
+- Squatted token metadata impersonating reputable mints
+- Compromised IDL payloads served through dApp frontends
+- Suspicious program deployments masquerading as known protocols
 
-requires node 22+, pnpm 10+, docker.
+What it deliberately does **not** do: trade execution guidance, price-impact warnings, MEV routing. Different tool, different problem.
+
+## Repository layout
+
+```
+packages/core   Rule engine, instruction parser, policy types
+packages/ai     Anthropic-backed analysis layer (Haiku + Opus)
+packages/sdk    Client library for wallets and dApps
+apps/web        Dashboard, live demo, public threat feed
+```
+
+Strict TypeScript, pnpm workspaces, `@solana/kit` (not the retired web3.js v1), Prisma + Postgres, Redis. Docker Compose for local development, the same containers in production.
+
+## Running locally
+
+Prereqs: Node 22+, pnpm 10+, Docker.
 
 ```bash
 pnpm install
-cp .env.example .env   # fill in HELIUS_API_KEY, ANTHROPIC_API_KEY
-docker compose up -d   # postgres + redis
-pnpm -F web dev        # http://localhost:3000
+cp .env.example .env    # HELIUS_API_KEY, ANTHROPIC_API_KEY
+docker compose up -d    # postgres + redis
+pnpm -F web dev
 ```
 
-## why
+## Roadmap
 
-blockaid and blowfish already do this but they're closed. solshield is the open alternative. no token, no VC, just code.
-
-## roadmap
-
-- [x] monorepo scaffold
-- [ ] tx parser + instruction decoder (`@solana/kit`)
-- [ ] static rules: drainer patterns, unlimited approvals, suspicious mints
-- [ ] ai layer: haiku 4.5 (fast classify) + opus 4.7 (deep analysis)
+- [x] Monorepo scaffold
+- [ ] Instruction decoder on top of `@solana/kit`
+- [ ] Static rule set — the top 20 drainer patterns at minimum
+- [ ] Forked-mainnet simulator with balance/ownership diffing
+- [ ] AI layer — Haiku 4.5 triage + Opus 4.7 deep reasoning
 - [ ] `@solshield/sdk` published to npm
-- [ ] live demo on mainnet
-- [ ] wallet integrations (phantom, solflare, backpack)
+- [ ] Wallet integrations — Phantom, Solflare, Backpack
+- [ ] Public threat feed with signed, timestamped incidents
+- [ ] Third-party security audit before 1.0
 
-## license
+## Security
 
-apache 2.0. see [`LICENSE`](./LICENSE).
+SolShield is security-critical software. If you think you have found a vulnerability, do **not** open a public issue. Read [`SECURITY.md`](./SECURITY.md) for the disclosure path.
 
-## contact
+Nothing here is a substitute for reviewing transactions yourself. SolShield reduces risk. It does not eliminate it.
 
-open an issue, or dm [@0xnullpavel](https://github.com/0xnullpavel).
+## Contributing
+
+[`CONTRIBUTING.md`](./CONTRIBUTING.md). Rule submissions are especially welcome — a new drainer pattern the same day it hits mainnet is worth more than any feature.
+
+## License
+
+Apache 2.0. See [`LICENSE`](./LICENSE).
+
+---
+
+Maintained by [@0xnullpavel](https://github.com/0xnullpavel). Reachable through GitHub issues or `security@solshield.dev` for sensitive reports.
