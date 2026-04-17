@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.4';
+const SOLSHIELD_VERSION = '0.1.5';
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -676,12 +676,16 @@ function wrapWalletStandardWallet(wallet: WalletStandardWallet | unknown): void 
 function setupWalletStandardHook(): void {
   // Our API. Wallets call `register(wallet)` on this when they discover us.
   // Each wallet entry is independently guarded — one bad wallet can't poison the rest.
+  // The wrapping returns a Proxy; the wallet that called us continues with the
+  // unwrapped instance (it doesn't read its own re-registered self), but any
+  // dApp that later receives the wallet via getWallets() will get the wrapped
+  // version because we mutated nothing on the underlying object.
   const ourApi: WalletStandardApi = Object.freeze({
     register: (...wallets: WalletStandardWallet[]) => {
       if (inSafeMode()) return () => undefined;
       for (const w of wallets) {
         try {
-          wrapWalletStandardWallet(w);
+          wrapWalletWithProxy(w);
         } catch (err) {
           recordError('wallet-standard:register-iter', err);
         }
@@ -691,21 +695,27 @@ function setupWalletStandardHook(): void {
   });
 
   try {
-    window.addEventListener('wallet-standard:register-wallet', (event: Event) => {
-      if (inSafeMode()) return;
-      try {
-        const detail = (event as CustomEvent).detail;
-        if (typeof detail === 'function') {
-          try {
-            detail(ourApi);
-          } catch (err) {
-            recordError('wallet-standard:register-wallet:detail-callback', err);
+    // CAPTURE PHASE — guarantees we see the event before the dApp's listener,
+    // regardless of script load order. Critical for security extensions.
+    window.addEventListener(
+      'wallet-standard:register-wallet',
+      (event: Event) => {
+        if (inSafeMode()) return;
+        try {
+          const detail = (event as CustomEvent).detail;
+          if (typeof detail === 'function') {
+            try {
+              detail(ourApi);
+            } catch (err) {
+              recordError('wallet-standard:register-wallet:detail-callback', err);
+            }
           }
+        } catch (err) {
+          recordError('wallet-standard:register-wallet:listener', err);
         }
-      } catch (err) {
-        recordError('wallet-standard:register-wallet:listener', err);
-      }
-    });
+      },
+      { capture: true },
+    );
   } catch (err) {
     recordError('wallet-standard:addEventListener', err);
   }
@@ -746,129 +756,249 @@ function setupWalletStandardHook(): void {
 }
 
 /* ──────────────────────────────────────────────────────────────────
- * Pre-write provider trap
+ * dispatchEvent hijack — intercept wallet-standard:app-ready from dApps
  *
- * The most reliable interception point isn't AFTER a wallet writes
- * window.solana — it's defining `window.solana` ourselves with a
- * setter, BEFORE any wallet runs. Whoever (Phantom, Solflare,
- * arbitrary new wallet) tries to assign `window.solana = provider`
- * goes through our setter, we wrap on write, and the dapp later
- * reads back the wrapped version. This is the technique used by
- * Pocket Universe, Stelo, ScamSniffer.
+ * Modern wallets (Phantom 2025+, Solflare, Backpack, Glow) define
+ * `window.solana` and `window.phantom` as NON-CONFIGURABLE properties
+ * for security. Object.defineProperty throws "Cannot redefine property"
+ * which is what crashed v0.1.3/4 on Magic Eden.
  *
- * NOTE: v0.1.3 had a window.postMessage interceptor here that caused
- * an infinite loop in React's scheduler (which calls postMessage for
- * task scheduling). Removed in v0.1.4 — the property-setter trap
- * achieves the same coverage without touching message dispatch.
+ * The interception point that actually works on modern wallets is the
+ * Wallet Standard handshake. The protocol:
+ *   1. App calls getWallets() → app dispatches `wallet-standard:app-ready`
+ *      with `{ detail: { register } }`.
+ *   2. Wallet's register-wallet listener invokes `register(wallet)`.
+ *
+ * If we hijack window.dispatchEvent, we see EVERY app-ready dispatched by
+ * EVERY dApp on the page, and can swap `detail.register` for our wrapping
+ * register before the wallet ever sees it. This is what Pocket Universe,
+ * Sherlock Wallet, and the modern WalletGuard Solana flow do.
+ *
+ * Verified against:
+ *   - github.com/wallet-standard/wallet-standard (spec source)
+ *   - docs.phantom.com/developer-powertools/wallet-standard
+ *   - github.com/TeamRaccoons/sherlock-wallet (Solana reference)
  * ────────────────────────────────────────────────────────────────── */
 
-/** Build a setter that wraps any incoming provider object on assignment. */
-function trapProvider(target: object, key: string, label: string): void {
-  // If something is already there, wrap and re-store via the new descriptor.
-  let stored: unknown = (target as Record<string, unknown>)[key];
-  if (stored && typeof stored === 'object') {
-    safeSync(`provider-trap:${label}:initial`, () => {
-      patchProvider(stored as Record<string, unknown>, label);
-    }, undefined);
-  }
+function setupDispatchEventHijack(): void {
+  const origDispatch = window.dispatchEvent.bind(window);
   try {
-    Object.defineProperty(target, key, {
-      configurable: true,
-      enumerable: true,
-      get: () => stored,
-      set: (newValue: unknown) => {
-        stored = newValue;
-        if (newValue && typeof newValue === 'object') {
-          safeSync(`provider-trap:${label}:set`, () => {
-            patchProvider(newValue as Record<string, unknown>, label);
-          }, undefined);
+    window.dispatchEvent = function (event: Event) {
+      try {
+        if (
+          !inSafeMode() &&
+          event &&
+          event.type === 'wallet-standard:app-ready' &&
+          'detail' in event
+        ) {
+          const detail = (event as CustomEvent).detail as
+            | { register?: (...wallets: WalletStandardWallet[]) => unknown }
+            | undefined;
+          if (detail && typeof detail.register === 'function') {
+            const realRegister = detail.register;
+            // Replace register so anything the wallet passes through gets wrapped.
+            detail.register = (...wallets: WalletStandardWallet[]) => {
+              const wrapped = wallets.map((w) => {
+                try {
+                  return wrapWalletWithProxy(w);
+                } catch (err) {
+                  recordError('dispatchEvent:wrap-wallet', err);
+                  return w;
+                }
+              });
+              return realRegister.call(detail, ...wrapped);
+            };
+          }
         }
-      },
-    });
+      } catch (err) {
+        recordError('dispatchEvent:inspect', err);
+      }
+      return origDispatch(event);
+    };
   } catch (err) {
-    recordError(`provider-trap:${label}:defineProperty`, err);
+    recordError('dispatchEvent:install', err);
   }
 }
 
-function setupProviderTraps(): void {
-  // window.solana — used by older Phantom builds and most wallet adapters.
-  safeSync('trap:window.solana', () => {
-    trapProvider(window, 'solana', 'window.solana');
-  }, undefined);
+/* ──────────────────────────────────────────────────────────────────
+ * Proxy-based wallet wrapping
+ *
+ * Direct mutation `wallet.features['solana:signMessage'].signMessage = fn`
+ * silently no-ops when the wallet froze the feature object (Backpack does
+ * this; Phantom does it intermittently). A Proxy intercepts at property-
+ * access time without touching the underlying object, so Object.freeze
+ * doesn't matter and Dynamic/Privy/Reown can't cache around us.
+ * ────────────────────────────────────────────────────────────────── */
 
-  // window.solflare — Solflare's primary handle.
-  safeSync('trap:window.solflare', () => {
-    trapProvider(window, 'solflare', 'solflare');
-  }, undefined);
+const SIGNING_FEATURES = new Set([
+  'solana:signMessage',
+  'solana:signTransaction',
+  'solana:signAndSendTransaction',
+  'solana:signIn',
+]);
 
-  // window.phantom — Phantom uses a nested object: window.phantom.solana.
-  // We can't trap nested keys before the parent exists, so we trap window.phantom
-  // and then trap .solana once phantom is set.
-  safeSync('trap:window.phantom', () => {
-    let phantomStored: unknown = (window as unknown as Record<string, unknown>).phantom;
-    const wrapPhantom = (p: unknown) => {
-      if (!p || typeof p !== 'object') return;
-      // If phantom.solana already exists, patch it.
-      const inner = (p as Record<string, unknown>).solana;
-      if (inner && typeof inner === 'object') {
-        patchProvider(inner as Record<string, unknown>, 'phantom.solana');
-      }
-      // Trap future writes to phantom.solana.
-      try {
-        const phantomObj = p as Record<string, unknown>;
-        let solanaStored: unknown = phantomObj.solana;
-        Object.defineProperty(phantomObj, 'solana', {
-          configurable: true,
-          enumerable: true,
-          get: () => solanaStored,
-          set: (newSolana: unknown) => {
-            solanaStored = newSolana;
-            if (newSolana && typeof newSolana === 'object') {
-              safeSync('trap:phantom.solana:set', () => {
-                patchProvider(newSolana as Record<string, unknown>, 'phantom.solana');
-              }, undefined);
+const SIGNING_METHODS_BY_FEATURE: Record<string, string> = {
+  'solana:signMessage': 'signMessage',
+  'solana:signTransaction': 'signTransaction',
+  'solana:signAndSendTransaction': 'signAndSendTransaction',
+  'solana:signIn': 'signIn',
+};
+
+function wrapSigningInvocation(
+  fn: (...args: unknown[]) => unknown,
+  featureName: string,
+): (this: unknown, ...args: unknown[]) => Promise<unknown> {
+  const intent: 'msg' | 'tx' =
+    featureName === 'solana:signTransaction' || featureName === 'solana:signAndSendTransaction'
+      ? 'tx'
+      : 'msg';
+
+  return async function (this: unknown, ...inputs: unknown[]): Promise<unknown> {
+    if (inSafeMode()) return fn.apply(this, inputs);
+    try {
+      const first = inputs[0] as Record<string, unknown> | undefined;
+      if (first) {
+        if (intent === 'msg') {
+          const message = (first.message as Uint8Array | undefined) ?? siwsInputToBytes(first);
+          if (message instanceof Uint8Array) {
+            const requestId = newId();
+            window.postMessage(
+              {
+                type: 'analyze-message',
+                id: requestId,
+                data: { message: serializeMessage(message) },
+              } as InpageRequest,
+              '*',
+            );
+            const response = await waitForVerdict(requestId, 5000);
+            if (response.verdict?.verdict !== 'safe') {
+              throw createRejectionError();
             }
-          },
-        });
-      } catch (err) {
-        recordError('trap:phantom.solana:defineProperty', err);
+          }
+        } else {
+          const tx = first.transaction;
+          if (tx instanceof Uint8Array) {
+            const requestId = newId();
+            window.postMessage(
+              {
+                type: 'analyze-tx',
+                id: requestId,
+                data: { tx: bytesToBase64(tx) },
+              } as InpageRequest,
+              '*',
+            );
+            const response = await waitForVerdict(requestId, 5000);
+            if (response.verdict?.verdict !== 'safe') {
+              throw createRejectionError();
+            }
+          }
+        }
       }
-    };
-
-    if (phantomStored && typeof phantomStored === 'object') {
-      wrapPhantom(phantomStored);
+      return fn.apply(this, inputs);
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err.message.includes('Verdict timeout') || err.message.includes('offline'))
+      ) {
+        console.warn('[SolShield] wallet-standard offline, failed open');
+        return fn.apply(this, inputs);
+      }
+      throw err;
     }
-    Object.defineProperty(window, 'phantom', {
-      configurable: true,
-      enumerable: true,
-      get: () => phantomStored,
-      set: (newPhantom: unknown) => {
-        phantomStored = newPhantom;
-        wrapPhantom(newPhantom);
-      },
-    });
-  }, undefined);
-
-  // Mark all three legacy hooks as "ready" — actual hook flips happen inside
-  // patchProvider when wallets assign themselves through our setter.
-  ensureStatus().hooks.legacyWindowSolana = true;
-  ensureStatus().hooks.legacyPhantom = true;
-  ensureStatus().hooks.legacySolflare = true;
-  // postMessage interceptor removed — see comment block above.
-  ensureStatus().hooks.postMessageInterceptor = false;
+  };
 }
 
-// Start patching when script loads. Each top-level setup is independently
-// guarded — if one throws, the others still install and the page stays usable.
+/**
+ * Wrap a wallet with a Proxy that intercepts the signing features on access.
+ * The underlying wallet object is unchanged — Object.freeze on features can't
+ * stop us, and SDKs that cache method references at a future point still get
+ * our wrapper because they read through the Proxy.
+ */
+function wrapWalletWithProxy(wallet: WalletStandardWallet): WalletStandardWallet {
+  if (!wallet || typeof wallet !== 'object') return wallet;
+  if (wrappedWallets.has(wallet)) return wallet;
+  try {
+    wrappedWallets.add(wallet);
+  } catch {
+    return wallet;
+  }
+
+  const featureProxyCache = new WeakMap<object, unknown>();
+
+  const proxied = new Proxy(wallet, {
+    get(target, prop, receiver) {
+      if (prop !== 'features') return Reflect.get(target, prop, receiver);
+      const features = Reflect.get(target, prop, receiver);
+      if (!features || typeof features !== 'object') return features;
+      const featuresObj = features as Record<string, unknown>;
+
+      return new Proxy(featuresObj, {
+        get(fTarget, fKey) {
+          const feature = Reflect.get(fTarget, fKey);
+          if (!feature || typeof feature !== 'object') return feature;
+          if (typeof fKey !== 'string' || !SIGNING_FEATURES.has(fKey)) return feature;
+
+          // Reuse the same feature-proxy across reads to avoid identity issues
+          // (some SDKs use Map<feature, ...> internally).
+          const cached = featureProxyCache.get(feature as object);
+          if (cached) return cached;
+
+          const featureProxy = new Proxy(feature as Record<string, unknown>, {
+            get(fpTarget, fpKey) {
+              const value = Reflect.get(fpTarget, fpKey);
+              if (typeof value !== 'function') return value;
+              if (fpKey !== SIGNING_METHODS_BY_FEATURE[fKey]) return value;
+              return wrapSigningInvocation(
+                value as (...args: unknown[]) => unknown,
+                fKey,
+              );
+            },
+          });
+          featureProxyCache.set(feature as object, featureProxy);
+          return featureProxy;
+        },
+      });
+    },
+  });
+
+  try {
+    ensureStatus().hooks.walletStandardWallets++;
+  } catch {
+    // ignore counter update failure
+  }
+
+  return proxied;
+}
+
+ensureStatus().hooks.legacyWindowSolana = false;
+ensureStatus().hooks.legacyPhantom = false;
+ensureStatus().hooks.legacySolflare = false;
+ensureStatus().hooks.postMessageInterceptor = false;
+
+// v0.1.5 init order — proxy-based interception via Wallet Standard.
 //
-// Order matters:
-//   1. setupProviderTraps    — define window.solana / window.phantom / window.solflare
-//                              with setters BEFORE any wallet writes them.
-//   2. initProviderPatching  — best-effort poll for wallets that already wrote
-//                              their provider before we got here.
-//   3. setupWalletStandardHook — modern dapp interception via wallet-standard.
-safeSync('init:provider-traps', setupProviderTraps, undefined);
-safeSync('init:legacy-providers', initProviderPatching, undefined);
+// Modern wallets (Phantom 2025+, Solflare, Backpack) define their globals
+// as non-configurable. The defineProperty trap from v0.1.3/4 always threw
+// "Cannot redefine property" and triggered safe-mode. We've dropped it.
+//
+// What works on modern Phantom: the Wallet Standard handshake. Two hooks:
+//   1. dispatchEvent hijack — catches the dApp's wallet-standard:app-ready
+//      and replaces detail.register so any wallet that responds gets
+//      Proxy-wrapped before reaching the real registry.
+//   2. wallet-standard:register-wallet capture-phase listener — catches
+//      wallets that announce themselves first; we hand them our own api
+//      whose register applies the same Proxy wrap.
+//
+// Both layers use the same wrapWalletWithProxy() — defeats Object.freeze
+// (Backpack), defeats reference caching (Dynamic / Privy / Reown), and
+// works regardless of which side (wallet or dApp) loads first.
+//
+// Legacy initProviderPatching is kept ONLY for ancient dApps that read
+// window.solana directly without going through Wallet Standard. It's a
+// no-op on Phantom 2025+ because window.solana is non-configurable, but
+// it doesn't crash anymore (we don't use defineProperty on it).
+safeSync('init:dispatch-hijack', setupDispatchEventHijack, undefined);
 safeSync('init:wallet-standard', setupWalletStandardHook, undefined);
+safeSync('init:legacy-providers', initProviderPatching, undefined);
 
 export {};
