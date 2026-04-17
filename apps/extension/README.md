@@ -36,7 +36,7 @@ Opens Chrome with the extension enabled. Changes auto-reload.
 
 ## How to test it without a wallet
 
-Visit **https://solshield.dev/test-extension** with the extension loaded.
+Visit **https://solshield.dev/demo** with the extension loaded.
 
 The page mounts a fake `window.solana` provider so the SolShield content
 script has something to wrap. Four buttons:

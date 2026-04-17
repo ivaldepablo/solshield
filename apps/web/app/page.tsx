@@ -219,11 +219,11 @@ function TopBar() {
       </div>
       <div className="flex items-center gap-3 sm:gap-4 text-[11px] tracking-[0.2em] uppercase">
         <a
-          href="/extension-preview"
-          className="text-neon-amber hover:text-neon-amber/80 transition-colors font-bold animate-pulse-glow border border-neon-amber/40 px-2 py-0.5"
-          title="see how the browser extension would catch drainers"
+          href="/demo"
+          className="text-neon-red hover:text-neon-red/80 transition-colors font-bold animate-pulse-glow border border-neon-red/50 px-2 py-0.5"
+          title="watch the extension catch a fake airdrop drainer"
         >
-          [ extension preview ]
+          [ ▶ live demo ]
         </a>
         <a
           href="/lab"

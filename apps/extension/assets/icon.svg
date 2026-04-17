@@ -1,43 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <filter id="neonGlow">
-      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
       <feMerge>
-        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
+    <linearGradient id="shieldFill" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00ff41" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#00ff41" stop-opacity="0.04"/>
+    </linearGradient>
   </defs>
 
-  <!-- Dark background -->
-  <rect width="128" height="128" fill="#0a0a0f"/>
+  <!-- Dark rounded-square background -->
+  <rect width="128" height="128" rx="22" fill="#0a0a0f"/>
 
-  <!-- Shield shape with neon green stroke -->
-  <g filter="url(#neonGlow)">
-    <!-- Shield: heater/kite shield silhouette -->
-    <path d="M 32 20 L 96 20 L 96 60 C 96 90 64 108 64 108 C 64 108 32 90 32 60 Z"
-          fill="none"
-          stroke="#00ff41"
-          stroke-width="2.5"
-          stroke-linejoin="round"
-          stroke-linecap="round"/>
-  </g>
+  <!-- Subtle inner border for that bezel feel -->
+  <rect x="3" y="3" width="122" height="122" rx="20"
+        fill="none" stroke="#00ff41" stroke-opacity="0.15" stroke-width="1"/>
 
-  <!-- Triangle mark (∆) inside shield -->
-  <g filter="url(#neonGlow)">
-    <path d="M 64 40 L 52 70 L 76 70 Z"
-          fill="none"
-          stroke="#00ff41"
-          stroke-width="2"
-          stroke-linejoin="round"
-          stroke-linecap="round"/>
-  </g>
+  <!-- Shield silhouette: classic heater shape, bold enough to read at 16x16 -->
+  <path d="M 64 16
+           L 106 28
+           L 106 60
+           Q 106 92 64 114
+           Q 22 92 22 60
+           L 22 28 Z"
+        fill="url(#shieldFill)"
+        stroke="#00ff41"
+        stroke-width="5.5"
+        stroke-linejoin="round"
+        filter="url(#glow)"/>
 
-  <!-- Subtle cyan accent line at bottom of shield -->
-  <g filter="url(#neonGlow)" opacity="0.6">
-    <line x1="45" y1="85" x2="83" y2="85"
-          stroke="#00e5ff"
-          stroke-width="1.5"
-          stroke-linecap="round"/>
-  </g>
+  <!-- Triangle (delta) mark inside the shield -->
+  <path d="M 64 44
+           L 88 86
+           L 40 86 Z"
+        fill="#00ff41"
+        fill-opacity="0.22"
+        stroke="#00ff41"
+        stroke-width="4.5"
+        stroke-linejoin="round"
+        filter="url(#glow)"/>
 </svg>
