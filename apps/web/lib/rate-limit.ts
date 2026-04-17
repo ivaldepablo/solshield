@@ -1,0 +1,106 @@
+import Redis, { type RedisOptions } from 'ioredis';
+
+export interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+  limit: number;
+}
+
+interface RateLimitOpts {
+  windowSeconds?: number;
+  max?: number;
+}
+
+const DEFAULT_WINDOW_SECONDS = 60;
+const DEFAULT_MAX = 10;
+
+type GlobalWithRedis = typeof globalThis & {
+  __solshieldRedis?: Redis | null;
+  __solshieldRedisUnavailable?: boolean;
+  __solshieldRedisWarned?: boolean;
+};
+
+const g = globalThis as GlobalWithRedis;
+
+function getRedis(): Redis | null {
+  if (g.__solshieldRedisUnavailable) return null;
+  if (g.__solshieldRedis) return g.__solshieldRedis;
+
+  const url = process.env.REDIS_URL;
+  if (!url) {
+    if (!g.__solshieldRedisWarned) {
+      console.warn('[rate-limit] REDIS_URL not set; rate limiting disabled (fail-open)');
+      g.__solshieldRedisWarned = true;
+    }
+    g.__solshieldRedisUnavailable = true;
+    return null;
+  }
+
+  const opts: RedisOptions = {
+    lazyConnect: true,
+    maxRetriesPerRequest: 1,
+    enableOfflineQueue: false,
+    connectTimeout: 2000,
+    // don't spam reconnect attempts — we want fast failure so the route doesn't hang
+    retryStrategy: () => null,
+  };
+
+  const client = new Redis(url, opts);
+  client.on('error', (err) => {
+    if (!g.__solshieldRedisWarned) {
+      console.warn(`[rate-limit] redis error: ${(err as Error).message} — failing open`);
+      g.__solshieldRedisWarned = true;
+    }
+  });
+
+  g.__solshieldRedis = client;
+  return client;
+}
+
+export async function checkRateLimit(
+  identifier: string,
+  opts: RateLimitOpts = {}
+): Promise<RateLimitResult> {
+  const windowSeconds = opts.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
+  const max = opts.max ?? DEFAULT_MAX;
+  const windowMs = windowSeconds * 1000;
+  const now = Date.now();
+  const bucket = Math.floor(now / windowMs);
+  const resetAt = (bucket + 1) * windowMs;
+
+  const client = getRedis();
+  if (!client) {
+    // fail-open if redis is down — we'd rather serve than 503
+    return { allowed: true, remaining: Infinity, resetAt: now, limit: max };
+  }
+
+  const key = `ratelimit:inspect:${identifier}:${bucket}`;
+  try {
+    const count = await client.incr(key);
+    if (count === 1) {
+      await client.expire(key, windowSeconds);
+    }
+    const remaining = Math.max(0, max - count);
+    return {
+      allowed: count <= max,
+      remaining,
+      resetAt,
+      limit: max,
+    };
+  } catch (err) {
+    if (!g.__solshieldRedisWarned) {
+      console.warn(`[rate-limit] redis call failed: ${(err as Error).message} — failing open`);
+      g.__solshieldRedisWarned = true;
+    }
+    return { allowed: true, remaining: Infinity, resetAt: now, limit: max };
+  }
+}
+
+export function rateLimitHeaders(rl: RateLimitResult): Record<string, string> {
+  return {
+    'X-RateLimit-Limit': String(rl.limit),
+    'X-RateLimit-Remaining': Number.isFinite(rl.remaining) ? String(rl.remaining) : String(rl.limit),
+    'X-RateLimit-Reset': String(Math.floor(rl.resetAt / 1000)),
+  };
+}
