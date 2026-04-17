@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.6';
+const SOLSHIELD_VERSION = '0.1.7';
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -310,6 +310,7 @@ function createProxyFn(
   // Create async wrapper. `this: unknown` lets strict TS compile `.apply(this, ...)`
   // while preserving the call-site receiver (i.e. the provider object Phantom cares about).
   const wrapped = async function (this: unknown, ...args: unknown[]) {
+    logEvent('info', 'intercept', `legacy ${type} called`);
     try {
       if (type === 'signTransaction') {
         // args[0] is the transaction
@@ -330,6 +331,10 @@ function createProxyFn(
 
         // Wait for verdict
         const response = await waitForVerdict(requestId, 5000);
+
+        const v = response.verdict?.verdict ?? 'unknown';
+        recordInterception('tx', v as 'safe' | 'suspicious' | 'danger' | 'unknown');
+        logEvent('info', 'verdict', `legacy tx → ${v}`);
 
         // If not safe, user rejected (verdict was shown in overlay)
         if (response.verdict?.verdict !== 'safe') {
@@ -359,6 +364,9 @@ function createProxyFn(
           );
 
           const response = await waitForVerdict(requestId, 5000);
+          const v = response.verdict?.verdict ?? 'unknown';
+          recordInterception('tx', v as 'safe' | 'suspicious' | 'danger' | 'unknown');
+          logEvent('info', 'verdict', `legacy txs[] → ${v}`);
 
           if (response.verdict?.verdict !== 'safe') {
             throw createRejectionError();
@@ -393,6 +401,9 @@ function createProxyFn(
         );
 
         const response = await waitForVerdict(requestId, 5000);
+        const v = response.verdict?.verdict ?? 'unknown';
+        recordInterception('msg', v as 'safe' | 'suspicious' | 'danger' | 'unknown');
+        logEvent('info', 'verdict', `legacy msg → ${v}`);
 
         if (response.verdict?.verdict !== 'safe') {
           throw createRejectionError();
@@ -408,6 +419,8 @@ function createProxyFn(
           err.message.includes('offline'))
       ) {
         console.warn('[SolShield] offline, failed open');
+        recordInterception(type === 'signMessage' ? 'msg' : 'tx', 'failed-open');
+        logEvent('warn', 'fail-open', `legacy ${type}: ${err.message}`);
         return original.apply(this, args);
       }
       throw err;
@@ -558,6 +571,7 @@ function wrapWalletStandardMethod(
 
   const orig = original as (...args: unknown[]) => unknown;
   const wrapped = async function (this: unknown, ...inputs: unknown[]) {
+    logEvent('info', 'intercept', `polled ws-${methodName} called`);
     try {
       // Wallet Standard methods receive (...inputs) where each input has
       // either `message: Uint8Array` (signMessage), `transaction: Uint8Array`
@@ -578,6 +592,12 @@ function wrapWalletStandardMethod(
               '*',
             );
             const response = await waitForVerdict(requestId, 5000);
+            const v = response.verdict?.verdict ?? 'unknown';
+            recordInterception(
+              methodName === 'signIn' ? 'wallet-standard-signin' : 'wallet-standard-msg',
+              v as 'safe' | 'suspicious' | 'danger' | 'unknown',
+            );
+            logEvent('info', 'verdict', `polled ws-${methodName} → ${v}`);
             if (response.verdict?.verdict !== 'safe') {
               throw createRejectionError();
             }
@@ -595,6 +615,12 @@ function wrapWalletStandardMethod(
               '*',
             );
             const response = await waitForVerdict(requestId, 5000);
+            const v = response.verdict?.verdict ?? 'unknown';
+            recordInterception(
+              'wallet-standard-tx',
+              v as 'safe' | 'suspicious' | 'danger' | 'unknown',
+            );
+            logEvent('info', 'verdict', `polled ws-${methodName} → ${v}`);
             if (response.verdict?.verdict !== 'safe') {
               throw createRejectionError();
             }
@@ -608,6 +634,11 @@ function wrapWalletStandardMethod(
         (err.message.includes('Verdict timeout') || err.message.includes('offline'))
       ) {
         console.warn('[SolShield] wallet-standard offline, failed open');
+        recordInterception(
+          intent === 'tx' ? 'wallet-standard-tx' : 'wallet-standard-msg',
+          'failed-open',
+        );
+        logEvent('warn', 'fail-open', `polled ws-${methodName}: ${err.message}`);
         return orig.apply(this, inputs);
       }
       throw err;
@@ -895,7 +926,12 @@ function wrapSigningInvocation(
               '*',
             );
             const response = await waitForVerdict(requestId, 5000);
-            logEvent('info', 'verdict', `msg → ${response.verdict?.verdict ?? 'unknown'}`);
+            const v = response.verdict?.verdict ?? 'unknown';
+            recordInterception(
+              featureName === 'solana:signIn' ? 'wallet-standard-signin' : 'wallet-standard-msg',
+              v as 'safe' | 'suspicious' | 'danger' | 'unknown',
+            );
+            logEvent('info', 'verdict', `msg → ${v}`);
             if (response.verdict?.verdict !== 'safe') {
               throw createRejectionError();
             }
@@ -916,7 +952,12 @@ function wrapSigningInvocation(
               '*',
             );
             const response = await waitForVerdict(requestId, 5000);
-            logEvent('info', 'verdict', `tx → ${response.verdict?.verdict ?? 'unknown'}`);
+            const v = response.verdict?.verdict ?? 'unknown';
+            recordInterception(
+              'wallet-standard-tx',
+              v as 'safe' | 'suspicious' | 'danger' | 'unknown',
+            );
+            logEvent('info', 'verdict', `tx → ${v}`);
             if (response.verdict?.verdict !== 'safe') {
               throw createRejectionError();
             }
@@ -932,7 +973,11 @@ function wrapSigningInvocation(
         (err.message.includes('Verdict timeout') || err.message.includes('offline'))
       ) {
         console.warn('[SolShield] wallet-standard offline, failed open');
-        logEvent('warn', 'fail-open', err.message);
+        recordInterception(
+          intent === 'tx' ? 'wallet-standard-tx' : 'wallet-standard-msg',
+          'failed-open',
+        );
+        logEvent('warn', 'fail-open', `${featureName}: ${err.message}`);
         return fn.apply(this, inputs);
       }
       throw err;
