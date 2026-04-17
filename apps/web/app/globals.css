@@ -8,6 +8,111 @@
 
 html,
 body {
-  background: #0a0a0b;
-  color: #e6e6e6;
+  background: #0a0a0f;
+  color: #e0e0e0;
+}
+
+body {
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      transparent 0px,
+      transparent 2px,
+      rgba(0, 229, 255, 0.015) 2px,
+      rgba(0, 229, 255, 0.015) 4px
+    ),
+    radial-gradient(ellipse at 50% 0%, rgba(0, 229, 255, 0.06), transparent 60%);
+}
+
+@layer utilities {
+  .corner-brackets {
+    position: relative;
+  }
+  .corner-brackets::before,
+  .corner-brackets::after,
+  .corner-brackets > .c-br-bl,
+  .corner-brackets > .c-br-br {
+    content: '';
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    border-color: #00e5ff;
+    pointer-events: none;
+  }
+  .corner-brackets::before {
+    top: -1px;
+    left: -1px;
+    border-top: 2px solid;
+    border-left: 2px solid;
+  }
+  .corner-brackets::after {
+    top: -1px;
+    right: -1px;
+    border-top: 2px solid;
+    border-right: 2px solid;
+  }
+  .corner-brackets > .c-br-bl {
+    bottom: -1px;
+    left: -1px;
+    border-bottom: 2px solid;
+    border-left: 2px solid;
+  }
+  .corner-brackets > .c-br-br {
+    bottom: -1px;
+    right: -1px;
+    border-bottom: 2px solid;
+    border-right: 2px solid;
+  }
+
+  .scanline {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 50;
+    overflow: hidden;
+  }
+  .scanline::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 120px;
+    background: linear-gradient(
+      to bottom,
+      transparent,
+      rgba(0, 229, 255, 0.04),
+      rgba(0, 229, 255, 0.08),
+      rgba(0, 229, 255, 0.04),
+      transparent
+    );
+    animation: scan 8s linear infinite;
+  }
+
+  .cursor-blink::after {
+    content: '_';
+    display: inline-block;
+    margin-left: 2px;
+    animation: blink 1s steps(1) infinite;
+  }
+
+  .text-glow-green {
+    text-shadow: 0 0 8px rgba(0, 255, 65, 0.5);
+  }
+  .text-glow-cyan {
+    text-shadow: 0 0 8px rgba(0, 229, 255, 0.5);
+  }
+  .text-glow-red {
+    text-shadow: 0 0 10px rgba(255, 0, 60, 0.6);
+  }
+}
+
+/* respect reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important;
+  }
 }
