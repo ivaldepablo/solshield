@@ -217,23 +217,30 @@ function TopBar() {
         </div>
         <span className="text-sm tracking-[0.25em] text-neon-green font-bold">SOLSHIELD</span>
       </div>
-      <div className="flex items-center gap-4 text-[11px] tracking-[0.2em] uppercase">
+      <div className="flex items-center gap-3 sm:gap-4 text-[11px] tracking-[0.2em] uppercase">
+        <a
+          href="/extension-preview"
+          className="text-neon-amber hover:text-neon-amber/80 transition-colors font-bold animate-pulse-glow border border-neon-amber/40 px-2 py-0.5"
+          title="see how the browser extension would catch drainers"
+        >
+          [ extension preview ]
+        </a>
         <a
           href="/lab"
-          className="text-neon-cyan/70 hover:text-neon-cyan transition-colors"
+          className="text-neon-cyan/70 hover:text-neon-cyan transition-colors hidden sm:inline"
           title="advanced terminal mode for devs"
         >
           [ /lab ]
         </a>
         <a
           href="https://github.com/0xnullpavel/solshield"
-          className="text-mute hover:text-neon-cyan transition-colors"
+          className="text-mute hover:text-neon-cyan transition-colors hidden md:inline"
           target="_blank"
           rel="noopener noreferrer"
         >
           [ github ]
         </a>
-        <span className="hidden sm:inline-flex items-center gap-1.5 text-neon-green">
+        <span className="hidden lg:inline-flex items-center gap-1.5 text-neon-green">
           <span className="w-1.5 h-1.5 rounded-full bg-neon-green animate-pulse" />
           ONLINE
         </span>
