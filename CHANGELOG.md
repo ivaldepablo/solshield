@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Five static detection rules:
+  - `token-freeze-abuse` (high)
+  - `stake-authority-hijack` (critical for withdrawer, high for staker)
+  - `memo-exfiltration` (low)
+  - `compute-budget-anomaly` (low)
+  - `multisig-cosigner-manipulation` (critical)
+
+### Changed
+
+- `mint-authority-transfer` now flags only the mint-tokens authority reassignment; freeze-authority changes moved to the new `token-freeze-abuse` rule.
+
 ## [0.1.0-alpha.0] — 2026-04-17
 
 ### Added

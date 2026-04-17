@@ -40,6 +40,16 @@ const SYSTEM_IX = {
   TRANSFER: 2,
 } as const;
 
+const STAKE_IX = {
+  AUTHORIZE: 1,
+  AUTHORIZE_CHECKED: 10,
+} as const;
+
+const COMPUTE_BUDGET_IX = {
+  SET_COMPUTE_UNIT_LIMIT: 2,
+  SET_COMPUTE_UNIT_PRICE: 3,
+} as const;
+
 const SPL_AUTHORITY = {
   MINT_TOKENS: 0,
   FREEZE_ACCOUNT: 1,
@@ -128,7 +138,7 @@ export const unlimitedSplApproval: Rule = {
 export const mintAuthorityTransfer: Rule = {
   id: 'mint-authority-transfer',
   severity: 'critical',
-  description: 'SetAuthority reassigning mint or freeze authority to a new key.',
+  description: 'SetAuthority reassigning the mint authority to a new key.',
 
   evaluate(ctx) {
     const findings: Finding[] = [];
@@ -137,20 +147,14 @@ export const mintAuthorityTransfer: Rule = {
       if (!isSplToken(pid)) return;
       if (ix.data.length < 3) return;
       if (ix.data[0] !== SPL_IX.SET_AUTHORITY) return;
-      const authorityType = ix.data[1]!;
-      const isSensitive =
-        authorityType === SPL_AUTHORITY.MINT_TOKENS ||
-        authorityType === SPL_AUTHORITY.FREEZE_ACCOUNT;
-      if (!isSensitive) return;
-      const isSetNotClear = ix.data[2] === 1;
-      if (!isSetNotClear) return;
-      const label = authorityType === SPL_AUTHORITY.MINT_TOKENS ? 'mint' : 'freeze';
+      if (ix.data[1] !== SPL_AUTHORITY.MINT_TOKENS) return;
+      if (ix.data[2] !== 1) return;
       findings.push({
         ruleId: 'mint-authority-transfer',
         severity: 'critical',
         instructionIndex: i,
-        message: `${label} authority is being reassigned to a new key.`,
-        details: { authorityType: label },
+        message: 'mint authority is being reassigned to a new key.',
+        details: { authorityType: 'mint' },
       });
     });
     return findings;
@@ -358,6 +362,200 @@ export const closeTokenAccountToAttacker: Rule = {
   },
 };
 
+// -------- rule 8: token-freeze-abuse --------
+
+export const tokenFreezeAbuse: Rule = {
+  id: 'token-freeze-abuse',
+  severity: 'high',
+  description: 'SPL Token SetAuthority transferring FreezeAccount to a new key.',
+
+  evaluate(ctx) {
+    const findings: Finding[] = [];
+    ctx.tx.message.instructions.forEach((ix, i) => {
+      const pid = programIdOf(ctx.tx, ix);
+      if (!isSplToken(pid)) return;
+      if (ix.data.length < 3) return;
+      if (ix.data[0] !== SPL_IX.SET_AUTHORITY) return;
+      if (ix.data[1] !== SPL_AUTHORITY.FREEZE_ACCOUNT) return;
+      if (ix.data[2] !== 1) return;
+      findings.push({
+        ruleId: 'token-freeze-abuse',
+        severity: 'high',
+        instructionIndex: i,
+        message: 'Token freeze authority is being transferred — new holder can freeze any holder account.',
+        details: { authorityType: 'freeze', programId: pid },
+      });
+    });
+    return findings;
+  },
+};
+
+// -------- rule 9: stake-authority-hijack --------
+
+export const stakeAuthorityHijack: Rule = {
+  id: 'stake-authority-hijack',
+  severity: 'critical',
+  description: 'Stake program Authorize reassigning staker or withdrawer authority.',
+
+  evaluate(ctx) {
+    const findings: Finding[] = [];
+    ctx.tx.message.instructions.forEach((ix, i) => {
+      const pid = programIdOf(ctx.tx, ix);
+      if (pid !== STAKE) return;
+      if (ix.data.length < 4) return;
+      const disc = readU32LE(ix.data, 0);
+      // Authorize data: [disc:u32 LE, newAuthority:Pubkey(32), stakeAuthorize:u32 LE]
+      // AuthorizeChecked data: [disc:u32 LE, stakeAuthorize:u32 LE]
+      let stakeAuthorize: number | null = null;
+      if (disc === STAKE_IX.AUTHORIZE) {
+        if (ix.data.length < 40) return;
+        stakeAuthorize = readU32LE(ix.data, 36);
+      } else if (disc === STAKE_IX.AUTHORIZE_CHECKED) {
+        if (ix.data.length < 8) return;
+        stakeAuthorize = readU32LE(ix.data, 4);
+      } else {
+        return;
+      }
+      const isWithdrawer = stakeAuthorize === 1;
+      findings.push({
+        ruleId: 'stake-authority-hijack',
+        severity: isWithdrawer ? 'critical' : 'high',
+        instructionIndex: i,
+        message: isWithdrawer
+          ? 'Stake withdrawer authority is being reassigned.'
+          : 'Stake staker authority is being reassigned.',
+        details: {
+          stakeAuthorize: isWithdrawer ? 'withdrawer' : 'staker',
+          variant: disc === STAKE_IX.AUTHORIZE_CHECKED ? 'checked' : 'unchecked',
+        },
+      });
+    });
+    return findings;
+  },
+};
+
+// -------- rule 10: memo-exfiltration --------
+
+const MEMO_MAX_LEN = 400;
+const MEMO_NONPRINTABLE_RATIO = 0.5;
+
+export const memoExfiltration: Rule = {
+  id: 'memo-exfiltration',
+  severity: 'low',
+  description: 'Memo instruction carrying oversized or binary payload suggestive of data exfiltration.',
+
+  evaluate(ctx) {
+    const findings: Finding[] = [];
+    ctx.tx.message.instructions.forEach((ix, i) => {
+      const pid = programIdOf(ctx.tx, ix);
+      if (pid !== MEMO) return;
+      const len = ix.data.length;
+      if (len === 0) return;
+      let nonPrintable = 0;
+      for (let k = 0; k < len; k++) {
+        const b = ix.data[k]!;
+        const printable = (b >= 0x20 && b <= 0x7e) || b === 0x09 || b === 0x0a || b === 0x0d;
+        if (!printable) nonPrintable++;
+      }
+      const ratio = nonPrintable / len;
+      if (len <= MEMO_MAX_LEN && ratio <= MEMO_NONPRINTABLE_RATIO) return;
+      findings.push({
+        ruleId: 'memo-exfiltration',
+        severity: 'low',
+        instructionIndex: i,
+        message: 'Memo instruction carries a suspicious binary payload (possible data exfiltration).',
+        details: { length: len, nonPrintableRatio: ratio },
+      });
+    });
+    return findings;
+  },
+};
+
+// -------- rule 11: compute-budget-anomaly --------
+
+const CU_LIMIT_THRESHOLD = 1_200_000;
+
+export const computeBudgetAnomaly: Rule = {
+  id: 'compute-budget-anomaly',
+  severity: 'low',
+  description: 'Near-max compute unit limit paired with zero priority fee in the same transaction.',
+
+  evaluate(ctx) {
+    let limitIndex = -1;
+    let limitValue = 0;
+    let priceIndex = -1;
+    ctx.tx.message.instructions.forEach((ix, i) => {
+      const pid = programIdOf(ctx.tx, ix);
+      if (pid !== COMPUTE_BUDGET) return;
+      if (ix.data.length < 1) return;
+      const disc = ix.data[0];
+      // SetComputeUnitLimit: [disc:u8, limit:u32 LE]
+      if (disc === COMPUTE_BUDGET_IX.SET_COMPUTE_UNIT_LIMIT) {
+        if (ix.data.length < 5) return;
+        const limit = readU32LE(ix.data, 1);
+        if (limit > CU_LIMIT_THRESHOLD && limitIndex === -1) {
+          limitIndex = i;
+          limitValue = limit;
+        }
+        return;
+      }
+      // SetComputeUnitPrice: [disc:u8, microLamports:u64 LE]
+      if (disc === COMPUTE_BUDGET_IX.SET_COMPUTE_UNIT_PRICE) {
+        if (ix.data.length < 9) return;
+        const micro = readU64LE(ix.data, 1);
+        if (micro === 0n && priceIndex === -1) {
+          priceIndex = i;
+        }
+      }
+    });
+
+    if (limitIndex === -1 || priceIndex === -1) return [];
+    return [
+      {
+        ruleId: 'compute-budget-anomaly',
+        severity: 'low',
+        message: 'Unusual compute budget: near-maximum CU limit combined with zero priority fee.',
+        details: {
+          limit: limitValue,
+          microLamports: '0',
+          instructionIndexes: [limitIndex, priceIndex],
+        },
+      },
+    ];
+  },
+};
+
+// -------- rule 12: multisig-cosigner-manipulation --------
+
+const MULTISIG_MIN_ACCOUNTS = 4;
+
+export const multisigCosignerManipulation: Rule = {
+  id: 'multisig-cosigner-manipulation',
+  severity: 'critical',
+  description:
+    'SPL Token SetAuthority on an AccountOwner with a multisig-shaped account list (cosigner manipulation).',
+
+  evaluate(ctx) {
+    const findings: Finding[] = [];
+    ctx.tx.message.instructions.forEach((ix, i) => {
+      const pid = programIdOf(ctx.tx, ix);
+      if (!isSplToken(pid)) return;
+      if (ix.data.length < 3) return;
+      if (ix.data[0] !== SPL_IX.SET_AUTHORITY) return;
+      if (ix.data[1] !== SPL_AUTHORITY.ACCOUNT_OWNER) return;
+      if (ix.accounts.length < MULTISIG_MIN_ACCOUNTS) return;
+      findings.push({
+        ruleId: 'multisig-cosigner-manipulation',
+        severity: 'critical',
+        instructionIndex: i,
+        message: 'Account-owner change on a multisig-like account (likely cosigner manipulation).',
+        details: { accountCount: ix.accounts.length, programId: pid },
+      });
+    });
+    return findings;
+  },
+};
+
 // -------- runner --------
 
 export const BUILTIN_RULES: Rule[] = [
@@ -368,6 +566,11 @@ export const BUILTIN_RULES: Rule[] = [
   hiddenSolTransfer,
   splAccountOwnerChange,
   closeTokenAccountToAttacker,
+  tokenFreezeAbuse,
+  stakeAuthorityHijack,
+  memoExfiltration,
+  computeBudgetAnomaly,
+  multisigCosignerManipulation,
 ];
 
 const SEVERITY_WEIGHT: Record<Finding['severity'], number> = {
