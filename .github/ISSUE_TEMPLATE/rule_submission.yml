@@ -1,0 +1,46 @@
+name: Rule submission
+description: Propose a new detection rule
+title: '[rule] '
+labels: ['rule', 'enhancement']
+body:
+  - type: input
+    id: rule-id
+    attributes:
+      label: Proposed rule id
+      description: Kebab-case identifier.
+      placeholder: 'new-rule-id'
+    validations:
+      required: true
+
+  - type: input
+    id: severity
+    attributes:
+      label: Severity
+      description: One of low, medium, high, critical.
+      placeholder: 'high'
+    validations:
+      required: true
+
+  - type: textarea
+    id: attack-vector
+    attributes:
+      label: Attack vector and on-chain example
+      description: Describe the attack this rule catches. Include a transaction signature from mainnet if available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: matching-logic
+    attributes:
+      label: Matching logic
+      description: Pseudocode or byte layout showing how the rule decides a match.
+    validations:
+      required: true
+
+  - type: textarea
+    id: test-cases
+    attributes:
+      label: Positive and negative test cases
+      description: List the transactions that must trigger the rule and similar-looking transactions that must not.
+    validations:
+      required: true

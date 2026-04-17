@@ -1,0 +1,40 @@
+name: Bug report
+description: Report something that is broken in SolShield
+title: '[bug] '
+labels: ['bug']
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is broken? Be specific.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Transaction signature, network (mainnet/devnet), commit SHA, and the exact steps that trigger the bug.
+      placeholder: |
+        tx: <signature>
+        network: mainnet
+        commit: <sha>
+        steps:
+          1.
+          2.
+
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: Expected vs actual
+      description: What did you expect to happen, and what actually happened?
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Node version, OS, pnpm version.
+      placeholder: 'node 22.11.0, macOS 14.6, pnpm 10.33.0'
