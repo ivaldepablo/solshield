@@ -40,7 +40,11 @@ export async function POST(req: Request) {
   }
 
   try {
-    const analyzer = new Analyzer({ apiKey: anthropicKey });
+    const analyzer = new Analyzer({
+      apiKey: anthropicKey,
+      triageModel: process.env.SOLSHIELD_TRIAGE_MODEL,
+      deepModel: process.env.SOLSHIELD_DEEP_MODEL,
+    });
     const triage = await analyzer.triage(decoded);
     if (!triage.needsDeepReview) {
       return NextResponse.json({
