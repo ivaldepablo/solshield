@@ -111,10 +111,10 @@ async function main() {
   // dynamic content script. A reload reliably picks it up.
   await page.reload();
 
-  // Wait up to 30s for the test to complete (signMessage may wait for API)
+  // Wait up to 60s for the test to complete (signMessage may wait for API)
   log('waiting for test result...');
   let result = null;
-  for (let i = 0; i < 150; i++) {
+  for (let i = 0; i < 300; i++) {
     result = await page.evaluate(() => window.__solshieldTestResult || null);
     if (result) break;
     await new Promise((r) => setTimeout(r, 200));

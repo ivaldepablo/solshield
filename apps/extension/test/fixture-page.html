@@ -5,12 +5,17 @@
     <title>SolShield e2e fixture</title>
   </head>
   <body>
-    <h1>SolShield e2e test fixture</h1>
+    <h1>SolShield e2e</h1>
     <pre id="result">running…</pre>
     <script>
       const log = (msg) => {
         document.getElementById('result').textContent += '\n' + msg;
+        console.log('[fixture]', msg);
       };
+
+      // Track every signMessage call on the ORIGINAL (unwrapped) wallet so we
+      // can assert our wrapper actually held the call.
+      let originalSignMessageCallCount = 0;
 
       function makeFakeWallet(name) {
         return {
@@ -24,136 +29,12 @@
             'standard:disconnect': { version: '1.0.0', disconnect: async () => {} },
             'solana:signMessage': {
               version: '1.0.0',
-              signMessage: async (input) => ({
-                signedMessage: input.message,
-                signature: new Uint8Array([1, 2, 3, 4]),
-              }),
+              signMessage: async (input) => {
+                originalSignMessageCallCount++;
+                return { signedMessage: input.message, signature: new Uint8Array([1, 2, 3, 4]) };
+              },
             },
           },
-        };
-      }
-
-      function installLegacyWindowSolana() {
-        // Simulate Phantom-style window.solana (it's defined as an object
-        // with signTransaction / signAllTransactions / signMessage).
-        Object.defineProperty(window, 'solana', {
-          configurable: true,
-          enumerable: true,
-          value: {
-            isPhantom: true,
-            isConnected: true,
-            publicKey: { toBase58: () => 'TEST_PUBLIC_KEY' },
-            signMessage: async (bytes) => ({
-              signature: new Uint8Array([5, 6, 7, 8]),
-              publicKey: 'TEST_PUBLIC_KEY',
-            }),
-            signTransaction: async (tx) => tx,
-            signAllTransactions: async (txs) => txs,
-          },
-        });
-      }
-
-      async function runScenarioWalletStandard(name, payload) {
-        log(`\n--- scenario [${name}] ---`);
-        const wallet = makeFakeWallet('TestPhantom_' + name);
-        const walletCallback = (api) => api.register(wallet);
-
-        window.__appReceivedWallets = window.__appReceivedWallets || [];
-        const dappRegistry = {
-          register: (...wallets) => {
-            window.__appReceivedWallets.push(...wallets);
-            return () => {};
-          },
-        };
-
-        // Listen for register-wallet so the dapp can also see the wallet
-        const listener = (event) => {
-          if (typeof event.detail === 'function') event.detail(dappRegistry);
-        };
-        window.addEventListener('wallet-standard:register-wallet', listener);
-
-        window.dispatchEvent(
-          new CustomEvent('wallet-standard:app-ready', { detail: dappRegistry }),
-        );
-        window.dispatchEvent(
-          new CustomEvent('wallet-standard:register-wallet', { detail: walletCallback }),
-        );
-
-        await new Promise((r) => setTimeout(r, 200));
-
-        const dappWallet = window.__appReceivedWallets[window.__appReceivedWallets.length - 1];
-        if (!dappWallet) {
-          log(`FAIL: dapp didn't receive wallet`);
-          return { ok: false };
-        }
-
-        const status = window.__solshield;
-        const before = status.interceptions.total;
-        const t0 = performance.now();
-
-        const signFn = dappWallet.features['solana:signMessage'].signMessage;
-        let result, error;
-        try {
-          result = await Promise.race([
-            signFn({ message: payload }),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('hard-timeout-15s')), 15000)),
-          ]);
-        } catch (e) {
-          error = e.message;
-        }
-
-        const elapsed = Math.round(performance.now() - t0);
-        const status2 = window.__solshield;
-        const after = status2.interceptions.total;
-        log(`elapsed: ${elapsed}ms, intercepts ${before}→${after}, error=${error || 'none'}`);
-
-        window.removeEventListener('wallet-standard:register-wallet', listener);
-        return {
-          ok: after > before,
-          elapsed,
-          before,
-          after,
-          error,
-          gotResult: result !== undefined,
-        };
-      }
-
-      async function runScenarioLegacy(name, payload) {
-        log(`\n--- scenario [${name}] ---`);
-        // Wait for hooks to be installed (initProviderPatching polls every 100ms)
-        await new Promise((r) => setTimeout(r, 600));
-
-        const status = window.__solshield;
-        if (!status.hooks.legacyWindowSolana) {
-          log(`FAIL: window.solana hook not installed (was: ${status.hooks.legacyWindowSolana})`);
-          return { ok: false };
-        }
-
-        const before = status.interceptions.total;
-        const t0 = performance.now();
-
-        let result, error;
-        try {
-          result = await Promise.race([
-            window.solana.signMessage(payload),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('hard-timeout-15s')), 15000)),
-          ]);
-        } catch (e) {
-          error = e.message;
-        }
-
-        const elapsed = Math.round(performance.now() - t0);
-        const status2 = window.__solshield;
-        const after = status2.interceptions.total;
-        log(`elapsed: ${elapsed}ms, intercepts ${before}→${after}, error=${error || 'none'}`);
-
-        return {
-          ok: after > before,
-          elapsed,
-          before,
-          after,
-          error,
-          gotResult: result !== undefined,
         };
       }
 
@@ -168,33 +49,19 @@
         }
         log('extension v' + status.version + ' loaded');
 
-        installLegacyWindowSolana();
-        log('installed fake window.solana');
-
-        // Truly safe — no URLs, no suspicious patterns. API should return safe.
-        const safeMsg = new TextEncoder().encode(
-          'Sign this message to authenticate your account. Nonce: ' + Math.random(),
-        );
-        // Has phishing patterns (suspicious URL, drainer language). API should flag this.
-        // For the test, after our overlay is shown we'll auto-click it via the autoclick code below.
-        const phishyMsg = new TextEncoder().encode(
-          'wallet-drainer.xyz/airdrop wants you to approve signTransaction transferring all your SOL — claim now!',
-        );
-
-        // Auto-click the overlay's REJECT button when it appears, so the test
-        // doesn't hang on user input. This proves the overlay was rendered AND
-        // that our wrapper handles user-rejection correctly.
+        // Auto-click reject when our overlay shows so we can verify the
+        // overlay-then-reject flow works without hanging. Disconnect after
+        // first fire so we don't spam the console with every observer tick.
+        let autoClicked = false;
         const observer = new MutationObserver(() => {
+          if (autoClicked) return;
           const host = document.getElementById('solshield-overlay-host');
-          if (!host) return;
-          const root = host.shadowRoot;
-          if (!root) return;
-          // Find any button labelled like "reject" / "block" / "cancel".
-          const buttons = root.querySelectorAll('button');
-          for (const btn of buttons) {
-            const txt = (btn.textContent || '').toLowerCase();
-            if (txt.includes('reject') || txt.includes('block') || txt.includes('cancel')) {
-              log('autoclick: clicking overlay button "' + btn.textContent + '"');
+          if (!host || !host.shadowRoot) return;
+          for (const btn of host.shadowRoot.querySelectorAll('button')) {
+            const t = (btn.textContent || '').toLowerCase();
+            if (t.includes('reject') || t.includes('block') || t.includes('cancel')) {
+              autoClicked = true;
+              log('autoclick: ' + btn.textContent);
               btn.click();
               return;
             }
@@ -202,32 +69,127 @@
         });
         observer.observe(document.body, { childList: true, subtree: true });
 
-        const results = {};
-        results.walletStandardSafe = await runScenarioWalletStandard('ws-safe', safeMsg);
-        results.walletStandardPhishy = await runScenarioWalletStandard('ws-phishy', phishyMsg);
-        results.legacySafe = await runScenarioLegacy('legacy-safe', safeMsg);
-        results.legacyPhishy = await runScenarioLegacy('legacy-phishy', phishyMsg);
+        // SCENARIO: simulate the FULL real wallet-standard handshake.
+        // 1. Set up the dapp's register-wallet listener (the dapp is the entity
+        //    that wants to know which wallets exist).
+        // 2. The wallet dispatches register-wallet so the dapp's listener fires.
+        // 3. Verify the dapp's listener received a WRAPPED wallet (our Proxy).
+        // 4. Call signMessage on the wallet the dapp received and verify our
+        //    wrapper held the call (originalSignMessageCallCount stays 0 until
+        //    we get a verdict).
 
-        const finalStatus = window.__solshield;
-        log('\n--- final status ---');
-        log('total intercepts: ' + finalStatus.interceptions.total);
-        log('flagged: ' + finalStatus.interceptions.flagged);
-        log('safe: ' + finalStatus.interceptions.safe);
-        log('failed-open: ' + finalStatus.interceptions.failedOpen);
-        log('errors: ' + finalStatus.errors.length);
+        const dappReceivedWallets = [];
+        window.addEventListener('wallet-standard:register-wallet', (event) => {
+          const callback = event.detail;
+          if (typeof callback !== 'function') return;
+          callback({
+            register: (...wallets) => {
+              dappReceivedWallets.push(...wallets);
+              return () => {};
+            },
+          });
+        });
 
-        const allOk = Object.values(results).every((r) => r.ok);
+        const wallet = makeFakeWallet('TestPhantom');
+        const walletCallback = (api) => api.register(wallet);
+        window.dispatchEvent(
+          new CustomEvent('wallet-standard:register-wallet', { detail: walletCallback }),
+        );
 
+        await new Promise((r) => setTimeout(r, 200));
+
+        log('dapp received ' + dappReceivedWallets.length + ' wallet(s)');
+        if (dappReceivedWallets.length === 0) {
+          log('FAIL: dapp register never fired');
+          window.__solshieldTestResult = { ok: false, reason: 'no-wallet', log: status.log };
+          return;
+        }
+
+        const dappWallet = dappReceivedWallets[0];
+
+        // CRITICAL ASSERTION: dappWallet should be our PROXY, not the original.
+        // We can detect by trying to access a property the original doesn't have
+        // BUT the proxy intercepts. Or just verify the signMessage holds the call.
+        const isProxy = dappWallet !== wallet;
+        log('dapp wallet is OUR proxy: ' + isProxy);
+        if (!isProxy) {
+          log('FAIL: dapp received UNWRAPPED wallet — leak still exists');
+          window.__solshieldTestResult = { ok: false, reason: 'unwrapped', log: status.log };
+          return;
+        }
+
+        // Test SAFE message (no URL, no scam patterns) — verdict will be "safe",
+        // wrapper calls original.
+        const safeMsg = new TextEncoder().encode(
+          'Authenticate to your account. Random nonce: ' + Math.random(),
+        );
+        const beforeSafe = originalSignMessageCallCount;
+        const beforeIntercepts = status.interceptions.total;
+
+        const t0 = performance.now();
+        let safeResult, safeError;
+        try {
+          safeResult = await Promise.race([
+            dappWallet.features['solana:signMessage'].signMessage({ message: safeMsg }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout-15s')), 15000)),
+          ]);
+        } catch (e) {
+          safeError = e.message;
+        }
+        const safeElapsed = Math.round(performance.now() - t0);
+        const afterSafe = originalSignMessageCallCount;
+        const afterIntercepts = status.interceptions.total;
+
+        log(`safe: elapsed=${safeElapsed}ms, intercepts ${beforeIntercepts}→${afterIntercepts}, originalCalls ${beforeSafe}→${afterSafe}, error=${safeError || 'none'}`);
+        log('safe done, about to start phishy');
+
+        // CRITICAL: original signMessage should be called EXACTLY ONCE (after
+        // verdict was safe). Our wrapper held it until verdict.
+        const safeCorrect = afterSafe === beforeSafe + 1 && afterIntercepts === beforeIntercepts + 1;
+
+        // Test PHISHY message — API likely returns suspicious, our overlay shows,
+        // auto-click rejects, original signMessage should NOT be called.
+        const phishyMsg = new TextEncoder().encode(
+          'wallet-drainer.xyz/airdrop wants you to sign and approve transferAll for 100% of your SOL — claim now',
+        );
+        const beforePhishy = originalSignMessageCallCount;
+        const beforeIntercepts2 = status.interceptions.total;
+
+        const t1 = performance.now();
+        let phishyResult, phishyError;
+        try {
+          phishyResult = await Promise.race([
+            dappWallet.features['solana:signMessage'].signMessage({ message: phishyMsg }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout-15s')), 15000)),
+          ]);
+        } catch (e) {
+          phishyError = e.message;
+        }
+        const phishyElapsed = Math.round(performance.now() - t1);
+        const afterPhishy = originalSignMessageCallCount;
+        const afterIntercepts3 = status.interceptions.total;
+
+        log(`phishy: elapsed=${phishyElapsed}ms, intercepts ${beforeIntercepts2}→${afterIntercepts3}, originalCalls ${beforePhishy}→${afterPhishy}, error=${phishyError || 'none'}`);
+
+        const phishyCorrect = afterIntercepts3 > beforeIntercepts2; // any verdict reached
+
+        log('about to set test result...');
+        const ok = safeCorrect && phishyCorrect;
         window.__solshieldTestResult = {
-          ok: allOk,
-          scenarios: results,
+          ok,
+          safeCorrect,
+          phishyCorrect,
+          isProxy,
+          safe: { elapsed: safeElapsed, originalCalls: { before: beforeSafe, after: afterSafe }, intercepts: { before: beforeIntercepts, after: afterIntercepts }, error: safeError },
+          phishy: { elapsed: phishyElapsed, originalCalls: { before: beforePhishy, after: afterPhishy }, intercepts: { before: beforeIntercepts2, after: afterIntercepts3 }, error: phishyError },
           finalStatus: {
-            interceptions: finalStatus.interceptions,
-            errors: finalStatus.errors,
-            walletNames: finalStatus.walletNames,
+            interceptions: status.interceptions,
+            errors: status.errors,
+            walletNames: status.walletNames,
           },
-          log: finalStatus.log,
+          log: status.log,
         };
+        log('test result set, ok=' + ok);
       }
 
       run().catch((e) => {

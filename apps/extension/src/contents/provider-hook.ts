@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.9';
+const SOLSHIELD_VERSION = '0.2.0';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
@@ -761,7 +761,32 @@ function wrapWalletStandardWallet(wallet: WalletStandardWallet | unknown): void 
   }
 }
 
+/**
+ * v0.2.0 critical fix: register-wallet redispatch pattern.
+ *
+ * The wallet-standard discovery dance has a fatal flaw if you only ATTACH
+ * a listener: the wallet dispatches register-wallet → both YOU and the
+ * dapp's listener fire. The wallet calls your callback AND the dapp's
+ * callback separately. You wrap your copy. The dapp gets the unwrapped
+ * original. Every signing call from the dapp bypasses your hook.
+ *
+ * The fix is to MUTATE THE EVENT before it reaches the dapp:
+ *   1. Catch register-wallet in capture phase
+ *   2. stopImmediatePropagation()
+ *   3. Redispatch a NEW event whose detail is a wrapping callback
+ *   4. The dapp's listener catches the new event and calls our wrapping
+ *      callback with its api. Our wrapping callback wraps the api, then
+ *      calls the original wallet callback with the wrapped api.
+ *   5. The wallet calls wrappedApi.register(self) → we wrap → call dappApi
+ *      .register(wrappedWallet) → dapp ends up with the wrapped wallet.
+ *
+ * This is what Pocket Universe / Stelo / Wallet Guard all do (they use
+ * window.ethereum proxy, but the same "intercept-and-hold" pattern).
+ */
 function setupWalletStandardHook(): void {
+  // Marker for "this detail is OUR wrapping callback" so we don't infinite-loop.
+  const WRAPPING_MARKER = '__solshield_wrapping_detail';
+
   // Our API. Wallets call `register(wallet)` on this when they discover us.
   // Each wallet entry is independently guarded — one bad wallet can't poison the rest.
   // The wrapping returns a Proxy; the wallet that called us continues with the
@@ -783,22 +808,63 @@ function setupWalletStandardHook(): void {
   });
 
   try {
-    // CAPTURE PHASE — guarantees we see the event before the dApp's listener,
-    // regardless of script load order. Critical for security extensions.
+    // CAPTURE PHASE — guarantees we see the event before the dApp's listener.
     window.addEventListener(
       'wallet-standard:register-wallet',
       (event: Event) => {
         if (inSafeMode()) return;
         try {
-          const detail = (event as CustomEvent).detail;
-          if (typeof detail === 'function') {
-            logEvent('info', 'register-wallet', 'wallet announced itself, calling our register');
+          const detail = (event as CustomEvent).detail as
+            | (((api: WalletStandardApi) => void) & { [k: string]: boolean | undefined })
+            | undefined;
+          if (typeof detail !== 'function') return;
+
+          // Already-wrapped detail (we redispatched this) → let the dapp's
+          // listener handle it normally.
+          if (detail[WRAPPING_MARKER]) return;
+
+          // STOP propagation so the dapp's listener never sees this raw event.
+          // We'll redispatch with a wrapping detail.
+          event.stopImmediatePropagation();
+
+          logEvent('info', 'register-wallet', 'caught raw event, wrapping detail and redispatching');
+
+          const wrappingDetail = (apiFromAnyone: WalletStandardApi): void => {
+            // Build a wrapping API that wraps wallets, then forwards to the
+            // real api (the dapp's). When the wallet calls our register, we
+            // wrap and pipe wrapped wallets to the dapp's register so the
+            // dapp ends up with our Proxy-wrapped wallet.
+            const wrappingApi: WalletStandardApi = {
+              register: (...wallets: WalletStandardWallet[]) => {
+                if (inSafeMode()) return apiFromAnyone.register(...wallets);
+                const wrapped = wallets.map((w) => {
+                  try {
+                    return wrapWalletWithProxy(w);
+                  } catch (err) {
+                    recordError('wallet-standard:wrap-iter', err);
+                    return w;
+                  }
+                });
+                return apiFromAnyone.register(...wrapped);
+              },
+            };
             try {
-              detail(ourApi);
+              detail(wrappingApi);
             } catch (err) {
-              recordError('wallet-standard:register-wallet:detail-callback', err);
+              recordError('wallet-standard:wrapped-detail-call', err);
             }
-          }
+          };
+          (wrappingDetail as unknown as Record<string, boolean>)[WRAPPING_MARKER] = true;
+
+          // Redispatch the wrapped event so the dapp's listener picks it up.
+          // Our own listener will see the marker and pass through.
+          // (Do NOT also call detail(ourApi) as a fallback — that would call
+          // the wallet's callback twice and some wallets infinite-loop or
+          // re-dispatch when called more than once. The 500ms polling loop
+          // below catches any wallet that has no dapp listener.)
+          window.dispatchEvent(
+            new CustomEvent('wallet-standard:register-wallet', { detail: wrappingDetail }),
+          );
         } catch (err) {
           recordError('wallet-standard:register-wallet:listener', err);
         }
@@ -944,7 +1010,7 @@ function wrapSigningInvocation(
       ? 'tx'
       : 'msg';
 
-  return async function (this: unknown, ...inputs: unknown[]): Promise<unknown> {
+  const wrapper = async function (this: unknown, ...inputs: unknown[]): Promise<unknown> {
     if (inSafeMode()) return fn.apply(this, inputs);
     logEvent('info', 'intercept', `${featureName} called`);
     try {
@@ -1024,6 +1090,8 @@ function wrapSigningInvocation(
       throw err;
     }
   };
+  Object.defineProperty(wrapper, '__solshield_wrapped', { value: true });
+  return wrapper;
 }
 
 /**
@@ -1074,6 +1142,12 @@ function wrapWalletWithProxy(wallet: WalletStandardWallet): WalletStandardWallet
               const value = Reflect.get(fpTarget, fpKey);
               if (typeof value !== 'function') return value;
               if (fpKey !== SIGNING_METHODS_BY_FEATURE[fKey]) return value;
+              // If polling already wrapped this method in place, return as-is.
+              // Re-wrapping causes a 2-level nested wrapper that doubles
+              // latency and breaks the message correlation.
+              if ((value as { __solshield_wrapped?: boolean }).__solshield_wrapped) {
+                return value;
+              }
               return wrapSigningInvocation(
                 value as (...args: unknown[]) => unknown,
                 fKey,
