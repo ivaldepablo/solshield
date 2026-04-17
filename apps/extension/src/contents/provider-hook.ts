@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.7';
+const SOLSHIELD_VERSION = '0.1.8';
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -179,31 +179,39 @@ const pendingRequests = new Map<
   }
 >();
 
-// Listen for responses from content script
+// Listen for responses from content script.
+//
+// CRITICAL: window.postMessage broadcasts to ALL listeners on window —
+// including our own. We send analyze-* requests AND we listen for the
+// content-script's responses on the same channel. To avoid consuming our
+// own request (which would clearTimeout but never resolve/reject, hanging
+// the promise forever), we only accept messages that look like responses:
+// they must NOT carry our request `type` field, and must carry either
+// `verdict` or `error`.
 window.addEventListener(
   'message',
   (event) => {
-    // Only accept messages from window to itself (content script posts back)
     if (event.source !== window) return;
 
-    const response = event.data as ContentResponse | undefined;
-    if (
-      !response ||
-      typeof response !== 'object' ||
-      !('id' in response) ||
-      !pendingRequests.has(response.id)
-    ) {
-      return;
-    }
+    const data = event.data as ContentResponse | undefined;
+    if (!data || typeof data !== 'object' || !('id' in data)) return;
 
-    const pending = pendingRequests.get(response.id)!;
+    // Skip our own outgoing requests — they have a `type` field, responses don't.
+    if ('type' in (data as Record<string, unknown>)) return;
+
+    // Must be a response from overlay-mount — has verdict or error.
+    if (!('verdict' in data) && !('error' in data)) return;
+
+    if (!pendingRequests.has(data.id)) return;
+
+    const pending = pendingRequests.get(data.id)!;
     clearTimeout(pending.timeoutId);
-    pendingRequests.delete(response.id);
+    pendingRequests.delete(data.id);
 
-    if (response.error) {
-      pending.reject(new Error(response.error));
-    } else if (response.verdict) {
-      pending.resolve(response);
+    if (data.error) {
+      pending.reject(new Error(data.error));
+    } else if (data.verdict) {
+      pending.resolve(data);
     }
   },
   false
@@ -950,7 +958,9 @@ function wrapSigningInvocation(
               } as InpageRequest,
               '*',
             );
+            logEvent('info', 'await-verdict', `requestId=${requestId} waiting…`);
             const response = await waitForVerdict(requestId, 5000);
+            logEvent('info', 'await-verdict', `requestId=${requestId} resolved`);
             const v = response.verdict?.verdict ?? 'unknown';
             recordInterception(
               featureName === 'solana:signIn' ? 'wallet-standard-signin' : 'wallet-standard-msg',
