@@ -1,13 +1,62 @@
 {
   "name": "@solshield/sdk",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0-alpha.0",
+  "description": "Pre-signature Solana transaction firewall. Open-source alternative to Blowfish & Blockaid. AI-powered (Claude Haiku + Opus).",
+  "keywords": [
+    "solana",
+    "security",
+    "firewall",
+    "drainer",
+    "phishing",
+    "wallet",
+    "wallet-security",
+    "blockaid",
+    "blowfish",
+    "transaction-security",
+    "web3"
+  ],
+  "homepage": "https://solshield.dev",
+  "bugs": {
+    "url": "https://github.com/0xnullpavel/solshield/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xnullpavel/solshield.git",
+    "directory": "packages/sdk"
+  },
+  "license": "Apache-2.0",
+  "author": "0xnullpavel <security@solshield.dev>",
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
     "@solshield/core": "workspace:*"
