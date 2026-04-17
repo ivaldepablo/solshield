@@ -328,6 +328,10 @@ function Footer() {
   return (
     <footer className="border-t border-neon-green/15 bg-bg/60 backdrop-blur-sm px-4 py-4 text-center font-mono text-[11px] text-dim">
       <div className="flex flex-wrap justify-center gap-x-4 gap-y-1">
+        <a href="/privacy" className="hover:text-neon-cyan transition-colors">
+          /privacy
+        </a>
+        <span>·</span>
         <a href="/lab" className="hover:text-neon-cyan transition-colors">
           /lab — advanced terminal
         </a>

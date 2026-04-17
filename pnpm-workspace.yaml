@@ -1,3 +1,5 @@
 packages:
   - apps/*
   - packages/*
+patchedDependencies:
+  '@plasmohq/parcel-transformer-manifest@0.21.0': patches/@plasmohq__parcel-transformer-manifest@0.21.0.patch

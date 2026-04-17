@@ -15,5 +15,10 @@
   "devDependencies": {
     "prettier": "^3.4.2",
     "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@plasmohq/parcel-transformer-manifest@0.21.0": "patches/@plasmohq__parcel-transformer-manifest@0.21.0.patch"
+    }
   }
 }
