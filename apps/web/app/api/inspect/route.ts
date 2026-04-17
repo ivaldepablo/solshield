@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
-import { decodeBase64, runRules, type ThreatReport } from '@solshield/core';
+import { decodeBase64, runRules, simulate, type ThreatReport } from '@solshield/core';
 import { Analyzer } from '@solshield/ai';
 import { getClientIp, hashIp } from '@/lib/ip';
 import { checkRateLimit, rateLimitHeaders } from '@/lib/rate-limit';
+import { getHeliusRpc } from '@/lib/helius';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -53,7 +54,20 @@ export async function POST(req: Request) {
     );
   }
 
-  const ctx = { tx: decoded, network: body.network ?? 'mainnet', now: new Date() } as const;
+  const rpc = getHeliusRpc();
+  const simulation = rpc
+    ? await simulate(decoded, body.tx.trim(), rpc).catch((err) => {
+        console.warn('[inspect] simulation failed:', (err as Error).message);
+        return undefined;
+      })
+    : undefined;
+
+  const ctx = {
+    tx: decoded,
+    network: body.network ?? 'mainnet',
+    now: new Date(),
+    simulation,
+  } as const;
   const rulesReport = await runRules(ctx);
 
   const anthropicKey = process.env.ANTHROPIC_API_KEY;

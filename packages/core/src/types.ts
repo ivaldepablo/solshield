@@ -52,6 +52,7 @@ export interface InspectionContext {
   tx: DecodedTransaction;
   network: 'mainnet' | 'devnet';
   now: Date;
+  simulation?: import('./simulator').SimulationResult;
 }
 
 export interface Rule {

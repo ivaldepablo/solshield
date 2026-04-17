@@ -556,6 +556,84 @@ export const multisigCosignerManipulation: Rule = {
   },
 };
 
+// -------- rule 13: simulated-signer-drain (dynamic) --------
+
+const DRAIN_RATIO_CRITICAL = 0.9;
+const DRAIN_RATIO_HIGH = 0.5;
+
+export const simulatedSignerDrain: Rule = {
+  id: 'simulated-signer-drain',
+  severity: 'critical',
+  description: 'Simulation shows the signer loses a large fraction of their SOL balance.',
+
+  evaluate(ctx) {
+    const sim = ctx.simulation;
+    if (!sim || !sim.success) return [];
+    const ratio = sim.signerSolDrainRatio;
+    if (ratio < DRAIN_RATIO_HIGH) return [];
+    const severity: Finding['severity'] = ratio >= DRAIN_RATIO_CRITICAL ? 'critical' : 'high';
+    const pct = (ratio * 100).toFixed(1);
+    return [
+      {
+        ruleId: 'simulated-signer-drain',
+        severity,
+        message: `Simulation shows the signer would lose ${pct}% of their SOL balance in this transaction.`,
+        details: { drainRatio: ratio, balanceDiffs: sim.balanceDiffs.filter((d) => d.isSigner) },
+      },
+    ];
+  },
+};
+
+// -------- rule 14: simulated-token-wipe (dynamic) --------
+
+export const simulatedTokenWipe: Rule = {
+  id: 'simulated-token-wipe',
+  severity: 'high',
+  description: 'Simulation shows one or more SPL token accounts emptied to zero.',
+
+  evaluate(ctx) {
+    const sim = ctx.simulation;
+    if (!sim || !sim.success) return [];
+    const wiped = sim.tokenDiffs.filter((d) => d.preAmount > 0n && d.postAmount === 0n);
+    if (wiped.length === 0) return [];
+    return [
+      {
+        ruleId: 'simulated-token-wipe',
+        severity: wiped.length >= 3 ? 'critical' : 'high',
+        message: `Simulation empties ${wiped.length} token account${wiped.length === 1 ? '' : 's'} to zero.`,
+        details: {
+          count: wiped.length,
+          mints: wiped.map((d) => d.mint),
+          totalDelta: wiped
+            .reduce((acc, d) => acc + d.deltaAmount, 0n)
+            .toString(),
+        },
+      },
+    ];
+  },
+};
+
+// -------- rule 15: simulation-failure (informational) --------
+
+export const simulationFailure: Rule = {
+  id: 'simulation-failure',
+  severity: 'low',
+  description: 'Dynamic simulation failed. The transaction would revert on-chain.',
+
+  evaluate(ctx) {
+    const sim = ctx.simulation;
+    if (!sim || sim.success) return [];
+    return [
+      {
+        ruleId: 'simulation-failure',
+        severity: 'low',
+        message: `Transaction would fail on-chain: ${sim.error ?? 'unknown error'}.`,
+        details: { error: sim.error, logs: sim.logs.slice(-5) },
+      },
+    ];
+  },
+};
+
 // -------- runner --------
 
 export const BUILTIN_RULES: Rule[] = [
@@ -571,6 +649,9 @@ export const BUILTIN_RULES: Rule[] = [
   memoExfiltration,
   computeBudgetAnomaly,
   multisigCosignerManipulation,
+  simulatedSignerDrain,
+  simulatedTokenWipe,
+  simulationFailure,
 ];
 
 const SEVERITY_WEIGHT: Record<Finding['severity'], number> = {
