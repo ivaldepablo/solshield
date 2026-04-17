@@ -25,6 +25,7 @@ interface SolShieldStatus {
     walletStandardWallets: number;
     postMessageInterceptor: boolean;
   };
+  walletNames?: string[];
   interceptions: {
     total: number;
     safe: number;
@@ -33,6 +34,7 @@ interface SolShieldStatus {
     last: { at: number; kind: string; verdict: string } | null;
   };
   errors: Array<{ at: number; phase: string; message: string }>;
+  log?: Array<{ at: number; level: 'info' | 'warn' | 'err'; tag: string; msg: string }>;
 }
 
 type ApiStatus = { state: 'idle' | 'checking' | 'ok' | 'error'; ms?: number; error?: string };
@@ -280,6 +282,69 @@ export default function Diagnostic() {
             state={status?.hooks.postMessageInterceptor ? 'ok' : 'warn'}
             hint="catches wallet bridge calls that bypass the JS API (Dynamic, Privy, etc.)"
           />
+          {status?.walletNames && status.walletNames.length > 0 && (
+            <div className="text-xs text-mute mt-2 ml-5">
+              wallets seen:{' '}
+              {status.walletNames.map((n, i) => (
+                <span key={i} className="text-neon-green">
+                  {n}
+                  {i < status.walletNames!.length - 1 ? ', ' : ''}
+                </span>
+              ))}
+            </div>
+          )}
+        </Section>
+
+        <Section title="// live event log (this tab only)">
+          <p className="text-mute text-[11px] mb-2 leading-relaxed">
+            every hook event on <b>this tab</b>. to debug magiceden / jupiter / etc:
+            open that site → devtools console → run{' '}
+            <code className="text-neon-cyan">copy(JSON.stringify(__solshield.log,null,2))</code>{' '}
+            then paste here or share with us.
+          </p>
+          {status?.log && status.log.length > 0 && (
+            <div className="mb-2">
+              <Button
+                onClick={() => {
+                  void navigator.clipboard.writeText(JSON.stringify(status.log, null, 2));
+                }}
+              >
+                ⎘ copy log as json
+              </Button>
+            </div>
+          )}
+          {status?.log && status.log.length > 0 ? (
+            <div className="text-[11px] font-mono space-y-0.5 max-h-96 overflow-y-auto bg-bg/60 p-2 border border-neon-green/10">
+              {status.log
+                .slice()
+                .reverse()
+                .map((e, i) => {
+                  const color =
+                    e.level === 'err'
+                      ? 'text-neon-red'
+                      : e.level === 'warn'
+                        ? 'text-neon-amber'
+                        : 'text-neon-green';
+                  return (
+                    <div key={i} className="flex gap-2">
+                      <span className="text-dim shrink-0">
+                        {new Date(e.at).toISOString().slice(11, 23)}
+                      </span>
+                      <span className={`${color} shrink-0 w-32 truncate`} title={e.tag}>
+                        {e.tag}
+                      </span>
+                      <span className="text-fg/80 truncate" title={e.msg}>
+                        {e.msg}
+                      </span>
+                    </div>
+                  );
+                })}
+            </div>
+          ) : (
+            <div className="text-dim text-xs italic">
+              no events yet — visit a dapp in another tab to populate this
+            </div>
+          )}
         </Section>
 
         <Section title="// api reachability">

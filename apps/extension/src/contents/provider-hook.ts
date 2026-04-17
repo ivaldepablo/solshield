@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.5';
+const SOLSHIELD_VERSION = '0.1.6';
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -48,6 +48,8 @@ interface SolShieldStatus {
     walletStandardWallets: number;
     postMessageInterceptor: boolean;
   };
+  /** Names of wallets we've wrapped via Wallet Standard, in order of first sight. */
+  walletNames: string[];
   interceptions: {
     total: number;
     safe: number;
@@ -61,6 +63,8 @@ interface SolShieldStatus {
   };
   /** Last 20 errors thrown by our own hook code, for diagnostics. */
   errors: Array<{ at: number; phase: string; message: string }>;
+  /** Full event log (last 100). Higher-fidelity than counters — every hook event lands here. */
+  log: Array<{ at: number; level: 'info' | 'warn' | 'err'; tag: string; msg: string }>;
 }
 
 function ensureStatus(): SolShieldStatus {
@@ -78,11 +82,24 @@ function ensureStatus(): SolShieldStatus {
         walletStandardWallets: 0,
         postMessageInterceptor: false,
       },
+      walletNames: [],
       interceptions: { total: 0, safe: 0, flagged: 0, failedOpen: 0, last: null },
       errors: [],
+      log: [],
     };
   }
   return w.__solshield;
+}
+
+/** Append to circular event log. /diagnostic surfaces this for runtime debugging. */
+function logEvent(level: 'info' | 'warn' | 'err', tag: string, msg: string): void {
+  try {
+    const status = ensureStatus();
+    status.log.push({ at: Date.now(), level, tag, msg });
+    if (status.log.length > 100) status.log.shift();
+  } catch {
+    // ignore
+  }
 }
 
 const SAFE_MODE_THRESHOLD = 3; // errors
@@ -98,6 +115,7 @@ function recordError(phase: string, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
     status.errors.push({ at: Date.now(), phase, message });
     if (status.errors.length > 20) status.errors.shift();
+    logEvent('err', phase, message);
 
     if (!status.safeMode) {
       const recent = status.errors.filter((e) => Date.now() - e.at < SAFE_MODE_WINDOW_MS);
@@ -704,6 +722,7 @@ function setupWalletStandardHook(): void {
         try {
           const detail = (event as CustomEvent).detail;
           if (typeof detail === 'function') {
+            logEvent('info', 'register-wallet', 'wallet announced itself, calling our register');
             try {
               detail(ourApi);
             } catch (err) {
@@ -796,8 +815,10 @@ function setupDispatchEventHijack(): void {
             | undefined;
           if (detail && typeof detail.register === 'function') {
             const realRegister = detail.register;
+            logEvent('info', 'dispatch-hijack', 'caught wallet-standard:app-ready, swapping register');
             // Replace register so anything the wallet passes through gets wrapped.
             detail.register = (...wallets: WalletStandardWallet[]) => {
+              logEvent('info', 'dispatch-hijack', `register called with ${wallets.length} wallet(s)`);
               const wrapped = wallets.map((w) => {
                 try {
                   return wrapWalletWithProxy(w);
@@ -855,12 +876,15 @@ function wrapSigningInvocation(
 
   return async function (this: unknown, ...inputs: unknown[]): Promise<unknown> {
     if (inSafeMode()) return fn.apply(this, inputs);
+    logEvent('info', 'intercept', `${featureName} called`);
     try {
       const first = inputs[0] as Record<string, unknown> | undefined;
       if (first) {
         if (intent === 'msg') {
           const message = (first.message as Uint8Array | undefined) ?? siwsInputToBytes(first);
           if (message instanceof Uint8Array) {
+            const preview = serializeMessage(message).slice(0, 80);
+            logEvent('info', 'analyze-msg', preview);
             const requestId = newId();
             window.postMessage(
               {
@@ -871,13 +895,17 @@ function wrapSigningInvocation(
               '*',
             );
             const response = await waitForVerdict(requestId, 5000);
+            logEvent('info', 'verdict', `msg → ${response.verdict?.verdict ?? 'unknown'}`);
             if (response.verdict?.verdict !== 'safe') {
               throw createRejectionError();
             }
+          } else {
+            logEvent('warn', 'intercept', `${featureName}: no Uint8Array payload, passing through`);
           }
         } else {
           const tx = first.transaction;
           if (tx instanceof Uint8Array) {
+            logEvent('info', 'analyze-tx', `${tx.length} bytes`);
             const requestId = newId();
             window.postMessage(
               {
@@ -888,9 +916,12 @@ function wrapSigningInvocation(
               '*',
             );
             const response = await waitForVerdict(requestId, 5000);
+            logEvent('info', 'verdict', `tx → ${response.verdict?.verdict ?? 'unknown'}`);
             if (response.verdict?.verdict !== 'safe') {
               throw createRejectionError();
             }
+          } else {
+            logEvent('warn', 'intercept', `${featureName}: no Uint8Array tx, passing through`);
           }
         }
       }
@@ -901,6 +932,7 @@ function wrapSigningInvocation(
         (err.message.includes('Verdict timeout') || err.message.includes('offline'))
       ) {
         console.warn('[SolShield] wallet-standard offline, failed open');
+        logEvent('warn', 'fail-open', err.message);
         return fn.apply(this, inputs);
       }
       throw err;
@@ -914,9 +946,17 @@ function wrapSigningInvocation(
  * stop us, and SDKs that cache method references at a future point still get
  * our wrapper because they read through the Proxy.
  */
+/** Cached wrapped Proxies — same wallet must always map to the same Proxy
+ *  identity, otherwise SDKs that use Map<wallet, ...> get duplicate entries
+ *  and DynamicSDK's WeakMap-based session cache breaks. */
+const wrappedProxyCache = new WeakMap<WalletStandardWallet, WalletStandardWallet>();
+
 function wrapWalletWithProxy(wallet: WalletStandardWallet): WalletStandardWallet {
   if (!wallet || typeof wallet !== 'object') return wallet;
-  if (wrappedWallets.has(wallet)) return wallet;
+
+  const cached = wrappedProxyCache.get(wallet);
+  if (cached) return cached;
+
   try {
     wrappedWallets.add(wallet);
   } catch {
@@ -961,8 +1001,14 @@ function wrapWalletWithProxy(wallet: WalletStandardWallet): WalletStandardWallet
     },
   });
 
+  wrappedProxyCache.set(wallet, proxied);
+
   try {
-    ensureStatus().hooks.walletStandardWallets++;
+    const status = ensureStatus();
+    status.hooks.walletStandardWallets++;
+    const name = typeof wallet.name === 'string' ? wallet.name : '<unnamed>';
+    if (!status.walletNames.includes(name)) status.walletNames.push(name);
+    logEvent('info', 'wrap-wallet', `wrapped wallet: ${name}`);
   } catch {
     // ignore counter update failure
   }
@@ -997,8 +1043,10 @@ ensureStatus().hooks.postMessageInterceptor = false;
 // window.solana directly without going through Wallet Standard. It's a
 // no-op on Phantom 2025+ because window.solana is non-configurable, but
 // it doesn't crash anymore (we don't use defineProperty on it).
+logEvent('info', 'boot', `SolShield v${SOLSHIELD_VERSION} loading on ${location.host}`);
 safeSync('init:dispatch-hijack', setupDispatchEventHijack, undefined);
 safeSync('init:wallet-standard', setupWalletStandardHook, undefined);
 safeSync('init:legacy-providers', initProviderPatching, undefined);
+logEvent('info', 'boot', 'all hooks installed');
 
 export {};
