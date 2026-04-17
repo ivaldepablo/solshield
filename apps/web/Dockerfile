@@ -4,11 +4,12 @@ WORKDIR /app
 
 FROM base AS deps
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY patches/ ./patches/
 COPY apps/web/package.json apps/web/
 COPY packages/core/package.json packages/core/
 COPY packages/ai/package.json packages/ai/
 COPY packages/sdk/package.json packages/sdk/
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --filter=web...
 
 FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
