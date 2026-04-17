@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#0a0a0b"/>
+  <line x1="900" y1="630" x2="1200" y2="330" stroke="#ff2a6d" stroke-opacity="0.2" stroke-width="2"/>
+  <g font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace">
+    <text x="80" y="340" font-size="120" font-weight="600">
+      <tspan fill="#ff2a6d">sol</tspan><tspan fill="#e6e6e6">shield</tspan>
+    </text>
+    <text x="80" y="410" font-size="36" fill="#b5b5b5">Pre-signature transaction firewall for Solana</text>
+    <text x="80" y="550" font-size="28" fill="#8b8b8b">solshield.dev</text>
+  </g>
+</svg>
