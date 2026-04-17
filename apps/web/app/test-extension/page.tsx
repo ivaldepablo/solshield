@@ -27,17 +27,38 @@ const SIWS_LEGIT =
 const PERMIT_LIKELY =
   'Authorize transfer of 1,000,000 USDC from your wallet to address 9aB...DnK on behalf of dapp.tld';
 
+type WalletMode = 'unknown' | 'mock' | 'real' | 'locked';
+
 export default function TestExtensionPage() {
   const [hookDetected, setHookDetected] = useState<'unknown' | 'yes' | 'no'>(
     'unknown',
   );
+  const [walletMode, setWalletMode] = useState<WalletMode>('unknown');
   const [log, setLog] = useState<LogEntry[]>([]);
   const [busy, setBusy] = useState(false);
 
-  // Mount a fake window.solana so the SolShield provider-hook has something to wrap.
+  // Try to mount a fake window.solana so the SolShield provider-hook has something to wrap.
+  // If a real wallet (Phantom / Solflare / Backpack) is installed, it will already own
+  // window.solana — and SES inside Phantom freezes it as read-only. In that case we just
+  // detect the existing wallet and let the user run the buttons against THAT instead.
   useEffect(() => {
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const w = window as unknown as Record<string, unknown>;
 
+    // Path A — real wallet already on the page.
+    if (w.solana) {
+      setWalletMode('real');
+      // Detect SolShield: after a moment, the proxy will have wrapped the wallet's
+      // signMessage. We capture the reference now and compare.
+      const before = (w.solana as MockWallet).signMessage;
+      setTimeout(() => {
+        const after = (w.solana as MockWallet | undefined)?.signMessage;
+        setHookDetected(after && after !== before ? 'yes' : 'no');
+      }, 1500);
+      return;
+    }
+
+    // Path B — no wallet, mount a stub.
     const mock: MockWallet = {
       isPhantom: true,
       publicKey: { toString: () => 'TestWalletDemo11111111111111111111111111111' },
@@ -56,17 +77,20 @@ export default function TestExtensionPage() {
       },
     };
 
-    const w = window as unknown as Record<string, unknown>;
-    w.solana = mock;
-    w.phantom = { solana: mock };
+    try {
+      w.solana = mock;
+      w.phantom = { solana: mock };
+      setWalletMode('mock');
+    } catch {
+      // Some other extension already locked down window.solana even though it
+      // didn't define a wallet object. Rare but possible.
+      setWalletMode('locked');
+      return;
+    }
 
-    // Heuristic: if SolShield extension patched the function, it'll have re-defined the
-    // method. We can't reliably detect because the proxy preserves .toString(), but we
-    // can check after a short delay whether the function reference changed.
     const original = mock.signMessage;
     setTimeout(() => {
       const current = (w.solana as MockWallet | undefined)?.signMessage;
-      // If extension is loaded, current !== original (it's a proxy).
       setHookDetected(current && current !== original ? 'yes' : 'no');
     }, 1500);
   }, []);
@@ -127,6 +151,7 @@ export default function TestExtensionPage() {
           intercept signing calls and show the warning overlay — same as on a real dapp.
         </p>
 
+        <WalletModeBanner mode={walletMode} />
         <ExtensionStatus state={hookDetected} />
 
         <Section title="// step 1 — load the extension">
@@ -270,6 +295,36 @@ export default function TestExtensionPage() {
       </main>
 
       <Footer />
+    </div>
+  );
+}
+
+function WalletModeBanner({ mode }: { mode: WalletMode }) {
+  if (mode === 'unknown') return null;
+  if (mode === 'mock') {
+    return (
+      <div className="border border-neon-cyan/30 bg-neon-cyan/5 px-4 py-2 mb-2 text-xs">
+        <span className="text-neon-cyan">●</span> using a <strong>stub wallet</strong> —
+        no Phantom/Solflare detected. perfect for testing.
+      </div>
+    );
+  }
+  if (mode === 'real') {
+    return (
+      <div className="border border-neon-amber/30 bg-neon-amber/5 px-4 py-2 mb-2 text-xs leading-relaxed">
+        <span className="text-neon-amber">⚠</span> a real wallet is already on this page
+        (Phantom, Solflare or similar). Buttons will trigger your actual wallet&apos;s
+        approval popup with SolShield overlaid on top — but signMessage requires the
+        wallet to be connected first. <strong>Easiest test:</strong> open this page in a
+        new Chrome profile that doesn&apos;t have a wallet installed, just SolShield.
+      </div>
+    );
+  }
+  return (
+    <div className="border border-neon-red/40 bg-neon-red/5 px-4 py-2 mb-2 text-xs">
+      <span className="text-neon-red">✗</span> couldn&apos;t mount the stub wallet — some
+      other extension froze <code className="text-neon-cyan">window.solana</code>. Try
+      disabling other wallet extensions and reload.
     </div>
   );
 }
