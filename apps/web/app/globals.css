@@ -106,6 +106,82 @@ body {
   }
 }
 
+/* punk terminal effects */
+
+@keyframes glitch-x {
+  0%, 100% { transform: translate(0, 0); }
+  20% { transform: translate(-2px, 1px); }
+  40% { transform: translate(2px, -1px); }
+  60% { transform: translate(-1px, 0); }
+  80% { transform: translate(1px, 1px); }
+}
+
+.glitch {
+  position: relative;
+  color: #00ff41;
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.35);
+}
+.glitch::before,
+.glitch::after {
+  content: attr(data-text);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+}
+.glitch:hover::before,
+.glitch:hover::after {
+  opacity: 1;
+}
+.glitch:hover::before {
+  color: #ff003c;
+  animation: glitch-x 0.4s steps(2) infinite;
+  mix-blend-mode: screen;
+  text-shadow: 0 0 3px rgba(255, 0, 60, 0.6);
+}
+.glitch:hover::after {
+  color: #00e5ff;
+  animation: glitch-x 0.4s steps(2) infinite reverse;
+  mix-blend-mode: screen;
+  text-shadow: 0 0 3px rgba(0, 229, 255, 0.6);
+}
+
+@keyframes scanline-sweep {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+@keyframes feed-slide {
+  from { transform: translateY(-20px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.sticker {
+  display: inline-block;
+  border: 1px dashed rgba(0, 255, 65, 0.5);
+  padding: 4px 10px;
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: #00ff41;
+  transform: rotate(-1deg);
+  user-select: none;
+}
+.sticker-red { color: #ff003c; border-color: rgba(255, 0, 60, 0.5); transform: rotate(1.5deg); }
+.sticker-cyan { color: #00e5ff; border-color: rgba(0, 229, 255, 0.5); transform: rotate(-0.5deg); }
+.sticker-amber { color: #ffab00; border-color: rgba(255, 171, 0, 0.5); transform: rotate(1deg); }
+
+.noise::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.5 0'/></filter><rect width='120' height='120' filter='url(%23n)'/></svg>");
+  opacity: 0.05;
+  pointer-events: none;
+  z-index: 60;
+  mix-blend-mode: overlay;
+}
+
 /* respect reduced motion */
 @media (prefers-reduced-motion: reduce) {
   *,

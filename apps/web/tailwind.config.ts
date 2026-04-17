@@ -19,7 +19,7 @@ const config: Config = {
         },
       },
       fontFamily: {
-        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
+        mono: ['var(--font-mono)', 'ui-monospace', 'SFMono-Regular', 'JetBrains Mono', 'Menlo', 'monospace'],
       },
       animation: {
         blink: 'blink 1s steps(1) infinite',
