@@ -11,8 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@solshield/ai": "workspace:*",
     "@solshield/core": "workspace:*",
     "@solshield/sdk": "workspace:*",
+    "helius-sdk": "^1.4.3",
     "next": "^15.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
