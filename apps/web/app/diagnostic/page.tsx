@@ -16,6 +16,8 @@ const CLAUDE_AMBER = '#ffab00';
 interface SolShieldStatus {
   version: string;
   installedAt: number;
+  safeMode: boolean;
+  safeModeReason: string | null;
   hooks: {
     legacyWindowSolana: boolean;
     legacyPhantom: boolean;
@@ -30,6 +32,7 @@ interface SolShieldStatus {
     failedOpen: number;
     last: { at: number; kind: string; verdict: string } | null;
   };
+  errors: Array<{ at: number; phase: string; message: string }>;
 }
 
 type ApiStatus = { state: 'idle' | 'checking' | 'ok' | 'error'; ms?: number; error?: string };
@@ -173,6 +176,42 @@ export default function Diagnostic() {
         </p>
 
         <OverallBanner status={status} />
+
+        {status?.safeMode && (
+          <div className="border-2 border-neon-amber/60 bg-neon-amber/10 px-4 py-3 mb-6 text-sm">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-neon-amber font-bold">⚠ SAFE MODE ENGAGED</span>
+            </div>
+            <p className="text-fg text-xs">
+              {status.safeModeReason ?? 'self-disabled to protect this page.'} reload the
+              page to retry. if this happens repeatedly on a specific dapp, that dapp&apos;s
+              wallet integration is incompatible — file an issue with the URL.
+            </p>
+          </div>
+        )}
+
+        {status?.errors && status.errors.length > 0 && (
+          <Section title="// recent errors (from our own hook code)">
+            <div className="text-xs space-y-1.5 font-mono">
+              {status.errors
+                .slice()
+                .reverse()
+                .map((e, i) => (
+                  <div key={i} className="flex gap-3 py-1 border-b border-neon-red/20 last:border-0">
+                    <span className="text-dim shrink-0">
+                      {new Date(e.at).toISOString().slice(11, 19)}
+                    </span>
+                    <span className="text-neon-amber shrink-0 w-44 truncate" title={e.phase}>
+                      {e.phase}
+                    </span>
+                    <span className="text-neon-red text-[11px] truncate" title={e.message}>
+                      {e.message}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </Section>
+        )}
 
         <Section title="// extension presence">
           {status ? (

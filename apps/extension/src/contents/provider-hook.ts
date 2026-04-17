@@ -22,11 +22,25 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.2';
+const SOLSHIELD_VERSION = '0.1.3';
+
+/**
+ * v0.1.3 — bulletproof error handling.
+ *
+ * Every hook is wrapped in try/catch. Every error is recorded in
+ * window.__solshield.errors. If we throw 3+ errors in 5 seconds, safe-mode
+ * auto-engages and ALL our hooks become passthrough — guaranteeing that the
+ * extension can never break a page even if some new wallet/SDK shape trips
+ * our code in an unexpected way.
+ */
 
 interface SolShieldStatus {
   version: string;
   installedAt: number;
+  /** if true, every hook returns immediately — site loads as if extension was off */
+  safeMode: boolean;
+  /** the reason safe mode engaged, for /diagnostic to show */
+  safeModeReason: string | null;
   hooks: {
     legacyWindowSolana: boolean;
     legacyPhantom: boolean;
@@ -35,21 +49,18 @@ interface SolShieldStatus {
     postMessageInterceptor: boolean;
   };
   interceptions: {
-    /** counter — total signing requests we caught and analyzed */
     total: number;
-    /** counter — analyses that came back as safe */
     safe: number;
-    /** counter — verdicts that triggered the overlay (suspicious + danger) */
     flagged: number;
-    /** counter — calls where we failed open (API down, timeout, etc.) */
     failedOpen: number;
-    /** the most recent intercepted call, useful for the diagnostic page */
     last: {
       at: number;
       kind: 'tx' | 'msg' | 'wallet-standard-msg' | 'wallet-standard-tx' | 'wallet-standard-signin';
       verdict: 'safe' | 'suspicious' | 'danger' | 'failed-open' | 'unknown';
     } | null;
   };
+  /** Last 20 errors thrown by our own hook code, for diagnostics. */
+  errors: Array<{ at: number; phase: string; message: string }>;
 }
 
 function ensureStatus(): SolShieldStatus {
@@ -58,6 +69,8 @@ function ensureStatus(): SolShieldStatus {
     w.__solshield = {
       version: SOLSHIELD_VERSION,
       installedAt: Date.now(),
+      safeMode: false,
+      safeModeReason: null,
       hooks: {
         legacyWindowSolana: false,
         legacyPhantom: false,
@@ -66,21 +79,74 @@ function ensureStatus(): SolShieldStatus {
         postMessageInterceptor: false,
       },
       interceptions: { total: 0, safe: 0, flagged: 0, failedOpen: 0, last: null },
+      errors: [],
     };
   }
   return w.__solshield;
+}
+
+const SAFE_MODE_THRESHOLD = 3; // errors
+const SAFE_MODE_WINDOW_MS = 5000;
+
+/**
+ * Record an error from our own hook code. Auto-engages safe mode if errors
+ * pile up — guarantees the extension can never break the host page.
+ */
+function recordError(phase: string, err: unknown): void {
+  try {
+    const status = ensureStatus();
+    const message = err instanceof Error ? err.message : String(err);
+    status.errors.push({ at: Date.now(), phase, message });
+    if (status.errors.length > 20) status.errors.shift();
+
+    if (!status.safeMode) {
+      const recent = status.errors.filter((e) => Date.now() - e.at < SAFE_MODE_WINDOW_MS);
+      if (recent.length >= SAFE_MODE_THRESHOLD) {
+        status.safeMode = true;
+        status.safeModeReason = `${recent.length} errors in ${SAFE_MODE_WINDOW_MS / 1000}s — extension self-disabled to protect this page`;
+        console.warn('[SolShield]', status.safeModeReason);
+      }
+    }
+  } catch {
+    // can't even record? give up silently.
+  }
+}
+
+function inSafeMode(): boolean {
+  try {
+    return ensureStatus().safeMode;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wrap any sync function so a thrown error is recorded and swallowed —
+ * the original page-side caller sees a no-op instead of a crash.
+ */
+function safeSync<T>(phase: string, fn: () => T, fallback: T): T {
+  try {
+    return fn();
+  } catch (err) {
+    recordError(phase, err);
+    return fallback;
+  }
 }
 
 function recordInterception(
   kind: SolShieldStatus['interceptions']['last'] extends { kind: infer K } | null ? K : never,
   verdict: SolShieldStatus['interceptions']['last'] extends { verdict: infer V } | null ? V : never,
 ): void {
-  const status = ensureStatus();
-  status.interceptions.total++;
-  if (verdict === 'safe') status.interceptions.safe++;
-  else if (verdict === 'failed-open') status.interceptions.failedOpen++;
-  else if (verdict === 'suspicious' || verdict === 'danger') status.interceptions.flagged++;
-  status.interceptions.last = { at: Date.now(), kind, verdict };
+  try {
+    const status = ensureStatus();
+    status.interceptions.total++;
+    if (verdict === 'safe') status.interceptions.safe++;
+    else if (verdict === 'failed-open') status.interceptions.failedOpen++;
+    else if (verdict === 'suspicious' || verdict === 'danger') status.interceptions.flagged++;
+    status.interceptions.last = { at: Date.now(), kind, verdict };
+  } catch (err) {
+    recordError('recordInterception', err);
+  }
 }
 
 ensureStatus(); // always create the status object at script load
@@ -559,52 +625,89 @@ function siwsInputToBytes(input: Record<string, unknown>): Uint8Array | undefine
   return new TextEncoder().encode(lines.join('\n'));
 }
 
-function wrapWalletStandardWallet(wallet: WalletStandardWallet): void {
-  if (wrappedWallets.has(wallet)) return;
-  wrappedWallets.add(wallet);
+function wrapWalletStandardWallet(wallet: WalletStandardWallet | unknown): void {
+  if (inSafeMode()) return;
 
-  const features = wallet.features;
+  // Defensive: WeakSet REQUIRES that the key be an object.
+  // Dynamic / Privy / weird wallet shims sometimes pass primitives or null.
+  // The original v0.1.2 crashed here with "Invalid value used as weak map key",
+  // which then took down DynamicSDK on Magic Eden.
+  if (!wallet || typeof wallet !== 'object') return;
+
+  try {
+    if (wrappedWallets.has(wallet as WalletStandardWallet)) return;
+    wrappedWallets.add(wallet as WalletStandardWallet);
+  } catch (err) {
+    // Frozen / non-extensible objects can also reject WeakSet membership.
+    recordError('wrapWalletStandardWallet:weakset', err);
+    return;
+  }
+
+  const features = (wallet as WalletStandardWallet).features;
   if (!features || typeof features !== 'object') return;
 
   // Each feature lives at a namespaced key. We monkey-patch its method in place.
-  wrapWalletStandardMethod(features['solana:signMessage'], 'signMessage', 'msg');
-  wrapWalletStandardMethod(features['solana:signTransaction'], 'signTransaction', 'tx');
-  wrapWalletStandardMethod(
-    features['solana:signAndSendTransaction'],
-    'signAndSendTransaction',
-    'tx',
-  );
-  wrapWalletStandardMethod(features['solana:signIn'], 'signIn', 'msg');
+  // Each call is independently guarded so one missing/odd-shaped feature can't
+  // cascade and disable the rest.
+  safeSync('wrap-wallet-standard:signMessage', () => {
+    wrapWalletStandardMethod(features['solana:signMessage'], 'signMessage', 'msg');
+  }, undefined);
+  safeSync('wrap-wallet-standard:signTransaction', () => {
+    wrapWalletStandardMethod(features['solana:signTransaction'], 'signTransaction', 'tx');
+  }, undefined);
+  safeSync('wrap-wallet-standard:signAndSendTransaction', () => {
+    wrapWalletStandardMethod(
+      features['solana:signAndSendTransaction'],
+      'signAndSendTransaction',
+      'tx',
+    );
+  }, undefined);
+  safeSync('wrap-wallet-standard:signIn', () => {
+    wrapWalletStandardMethod(features['solana:signIn'], 'signIn', 'msg');
+  }, undefined);
 
-  ensureStatus().hooks.walletStandardWallets++;
+  try {
+    ensureStatus().hooks.walletStandardWallets++;
+  } catch {
+    // ignore counter update failure
+  }
 }
 
 function setupWalletStandardHook(): void {
   // Our API. Wallets call `register(wallet)` on this when they discover us.
+  // Each wallet entry is independently guarded — one bad wallet can't poison the rest.
   const ourApi: WalletStandardApi = Object.freeze({
     register: (...wallets: WalletStandardWallet[]) => {
-      wallets.forEach(wrapWalletStandardWallet);
-      // Return a no-op unregister — we don't need to actually unregister from our side.
+      if (inSafeMode()) return () => undefined;
+      for (const w of wallets) {
+        try {
+          wrapWalletStandardWallet(w);
+        } catch (err) {
+          recordError('wallet-standard:register-iter', err);
+        }
+      }
       return () => undefined;
     },
   });
 
-  // Listen for future wallet registration events. The wallet dispatches a
-  // `wallet-standard:register-wallet` event whose detail is a callback that
-  // expects to be called with `{ register }`.
   try {
     window.addEventListener('wallet-standard:register-wallet', (event: Event) => {
-      const detail = (event as CustomEvent).detail;
-      if (typeof detail === 'function') {
-        try {
-          detail(ourApi);
-        } catch {
-          // Swallow — never let our hook break the page.
+      if (inSafeMode()) return;
+      try {
+        const detail = (event as CustomEvent).detail;
+        if (typeof detail === 'function') {
+          try {
+            detail(ourApi);
+          } catch (err) {
+            recordError('wallet-standard:register-wallet:detail-callback', err);
+          }
         }
+      } catch (err) {
+        recordError('wallet-standard:register-wallet:listener', err);
       }
     });
-  } catch {
-    // If addEventListener fails for some reason, give up silently.
+  } catch (err) {
+    recordError('wallet-standard:addEventListener', err);
   }
 
   // Dispatch our own app-ready event so wallets that loaded BEFORE our content
@@ -613,22 +716,32 @@ function setupWalletStandardHook(): void {
     window.dispatchEvent(
       new CustomEvent('wallet-standard:app-ready', { detail: ourApi }),
     );
-  } catch {
-    // ignore
+  } catch (err) {
+    recordError('wallet-standard:dispatch-app-ready', err);
   }
 
   // Belt-and-braces: some apps construct their own getWallets() and only expose
   // it via navigator.wallets. Poll and wrap anything we missed.
   setInterval(() => {
-    const nav = navigator as unknown as { wallets?: { get?: () => readonly WalletStandardWallet[] } };
-    const reg = nav.wallets;
-    if (reg && typeof reg.get === 'function') {
-      try {
-        for (const w of reg.get()) wrapWalletStandardWallet(w);
-      } catch {
-        // ignore
-      }
-    }
+    if (inSafeMode()) return;
+    safeSync(
+      'wallet-standard:poll',
+      () => {
+        const nav = navigator as unknown as {
+          wallets?: { get?: () => readonly WalletStandardWallet[] };
+        };
+        const reg = nav.wallets;
+        if (!reg || typeof reg.get !== 'function') return;
+        const list = reg.get();
+        if (!list) return;
+        for (const w of list) {
+          if (w && typeof w === 'object') {
+            wrapWalletStandardWallet(w);
+          }
+        }
+      },
+      undefined,
+    );
   }, 500);
 }
 
@@ -656,43 +769,54 @@ function setupPostMessageInterceptor(): void {
       configurable: true,
       writable: true,
       value: function (this: Window, message: unknown, ...rest: unknown[]) {
-        // Inspect by shape — common wallet bridge patterns include a `method`
-        // field with 'signMessage' / 'signTransaction' / 'sign'.
-        if (message && typeof message === 'object') {
-          const msg = message as Record<string, unknown>;
-          const candidate =
-            (typeof msg.method === 'string' ? msg.method : undefined) ||
-            (typeof msg.type === 'string' ? msg.type : undefined) ||
-            '';
-          if (/sign(transaction|message|in|all)?/i.test(candidate)) {
-            // Just record — don't block (yet). The other hooks should have caught
-            // this. If they didn't, the diagnostic page will surface the gap.
-            const status = ensureStatus();
-            status.interceptions.total++;
-            status.interceptions.last = {
-              at: Date.now(),
-              kind: /transaction/i.test(candidate)
-                ? 'wallet-standard-tx'
-                : 'wallet-standard-msg',
-              verdict: 'unknown',
-            };
+        // Wrap the inspection in a try; if anything throws (cyclic objects,
+        // proxies that throw on access, etc.) we still pass through the message.
+        if (!inSafeMode()) {
+          try {
+            if (message && typeof message === 'object') {
+              const msg = message as Record<string, unknown>;
+              const candidate =
+                (typeof msg.method === 'string' ? msg.method : undefined) ||
+                (typeof msg.type === 'string' ? msg.type : undefined) ||
+                '';
+              if (candidate && /sign(transaction|message|in|all)?/i.test(candidate)) {
+                recordInterception(
+                  /transaction/i.test(candidate)
+                    ? 'wallet-standard-tx'
+                    : 'wallet-standard-msg',
+                  'unknown',
+                );
+              }
+            }
+          } catch (err) {
+            recordError('postMessage:inspect', err);
           }
         }
-        // pass through always
-        return original.call(window, message as never, ...(rest as []));
+        // pass through always — never let our inspection drop a real message
+        try {
+          return original.call(window, message as never, ...(rest as []));
+        } catch (err) {
+          // postMessage itself shouldn't throw, but be safe
+          recordError('postMessage:passthrough', err);
+        }
       },
     });
     installed = true;
-  } catch {
-    // window.postMessage is locked down by SES on some pages — ignore.
+  } catch (err) {
+    recordError('postMessage:defineProperty', err);
   }
 
-  ensureStatus().hooks.postMessageInterceptor = installed;
+  try {
+    ensureStatus().hooks.postMessageInterceptor = installed;
+  } catch {
+    // ignore counter update failure
+  }
 }
 
-// Start patching when script loads
-initProviderPatching();
-setupWalletStandardHook();
-setupPostMessageInterceptor();
+// Start patching when script loads. Each top-level setup is independently
+// guarded — if one throws, the others still install and the page stays usable.
+safeSync('init:legacy-providers', initProviderPatching, undefined);
+safeSync('init:wallet-standard', setupWalletStandardHook, undefined);
+safeSync('init:postmessage', setupPostMessageInterceptor, undefined);
 
 export {};
