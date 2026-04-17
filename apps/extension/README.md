@@ -6,10 +6,21 @@ Scan Solana transactions before you sign them. Real-time protection against drai
 
 - Intercepts transactions your wallet is about to sign and runs them through Claude AI analysis
 - Detects phishing domains, domain homograph attacks, and spoofed dapp names
-- Simulates transactions to show you exactly what they'd do to your account
-- Analyzes sign-in messages for credential harvesting attempts
-- Works with Phantom, Solflare, and other Solana wallets via the Wallet Standard
+- Analyzes sign-in messages for credential harvesting attempts (SIWS spoof, off-chain permits, RTL overrides)
 - Instant verdict: **safe**, **suspicious**, or **don't sign** — with reasons you can understand
+
+## Wallet support (0.1.1)
+
+Hooks **both** wallet provider APIs in use today on Solana:
+
+- **Wallet Standard** (`window.navigator.wallets`) — used by Magic Eden, Jupiter,
+  Tensor, Drift, Raydium and most modern dapps. Hooked via `signMessage`,
+  `signTransaction`, `signAndSendTransaction`, `signIn` features.
+- **Legacy** (`window.solana`, `window.phantom.solana`, `window.solflare`) — used
+  by older dapps and a few niche ones.
+
+Wallets covered: **Phantom, Solflare, Backpack, Glow, Nightly, Coinbase Wallet**
+and any other wallet that registers itself via the Wallet Standard.
 
 ## Install
 

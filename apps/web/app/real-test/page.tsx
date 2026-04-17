@@ -43,26 +43,50 @@ const PHISHING_URLS: Array<{ url: string; spoofs: string; reason: string }> = [
   },
 ];
 
-const REAL_DAPPS: Array<{ name: string; url: string; what: string }> = [
+type DappStatus = 'verified' | 'expected' | 'unknown';
+
+const REAL_DAPPS: Array<{
+  name: string;
+  url: string;
+  what: string;
+  status: DappStatus;
+  proto: 'wallet-standard' | 'legacy';
+}> = [
+  // Wallet Standard dapps — covered by v0.1.1's wallet-standard hook
   {
     name: 'Jupiter',
     url: 'https://jup.ag',
-    what: 'real DEX — try a token swap, see SAFE verdict before signing',
+    what: 'token swap — SolShield analyzes the signTransaction',
+    status: 'expected',
+    proto: 'wallet-standard',
   },
   {
     name: 'Magic Eden',
     url: 'https://magiceden.io',
-    what: 'NFT marketplace — sign-in messages get analyzed live',
+    what: 'sign-in message before browsing — analyzed via wallet-standard signMessage',
+    status: 'expected',
+    proto: 'wallet-standard',
   },
   {
     name: 'Tensor',
     url: 'https://tensor.trade',
-    what: 'NFT trading — bid/list signing flows tested',
+    what: 'wallet connect signs a verification message',
+    status: 'expected',
+    proto: 'wallet-standard',
   },
   {
     name: 'Drift',
     url: 'https://drift.trade',
-    what: 'perpetuals — order placement signing',
+    what: 'perpetuals — order placement signTransaction flow',
+    status: 'expected',
+    proto: 'wallet-standard',
+  },
+  {
+    name: 'Raydium',
+    url: 'https://raydium.io',
+    what: 'AMM swap — exercises signAndSendTransaction',
+    status: 'expected',
+    proto: 'wallet-standard',
   },
 ];
 
@@ -147,18 +171,38 @@ export default function RealTestPage() {
             {REAL_DAPPS.map((d) => (
               <li
                 key={d.url}
-                className="border border-neon-green/20 bg-bg/40 p-3 flex items-baseline justify-between gap-3"
+                className="border border-neon-green/20 bg-bg/40 p-3"
               >
-                <div>
+                <div className="flex items-baseline justify-between gap-3">
                   <External href={d.url}>
                     <span className="text-neon-green font-bold">{d.name}</span>{' '}
                     <span className="text-dim text-xs">{d.url.replace('https://', '')}</span>
                   </External>
-                  <p className="text-mute text-[11px] mt-1">{d.what}</p>
+                  <span
+                    className={`text-[10px] tracking-[0.15em] uppercase font-bold ${
+                      d.status === 'verified'
+                        ? 'text-neon-green'
+                        : 'text-neon-amber'
+                    }`}
+                  >
+                    {d.status === 'verified' ? '✓ verified' : '⏳ expected'}
+                  </span>
                 </div>
+                <p className="text-mute text-[11px] mt-1">{d.what}</p>
+                <p className="text-dim text-[10px] mt-1 font-mono">
+                  {d.proto === 'wallet-standard' ? '◇ wallet-standard' : '◇ legacy window.solana'}
+                </p>
               </li>
             ))}
           </ul>
+          <Note>
+            <strong>0.1.1 ships wallet-standard support</strong>, so modern dapps
+            (everything in the list above) trigger the overlay. v0.1.0 only hooked
+            <code className="text-neon-amber"> window.solana</code> legacy and would
+            silently miss these. After installing 0.1.1, mark each dapp{' '}
+            <span className="text-neon-green">✓ verified</span> in the source as you
+            confirm the overlay appears for that flow.
+          </Note>
           <Note>
             try to do a swap or sign a sign-in message. before Phantom opens its own
             confirmation popup, SolShield should show its overlay with the verdict

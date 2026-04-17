@@ -334,7 +334,209 @@ function initProviderPatching(): void {
   checkProviders();
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * Wallet Standard hook
+ *
+ * Modern dapps (Magic Eden, Jupiter latest, Tensor, Drift...) talk to
+ * wallets through the Wallet Standard registry, not via window.solana.
+ * Specifically they use @wallet-standard/app's `getWallets()` which
+ * dispatches a `wallet-standard:app-ready` event; wallets respond by
+ * calling `register(wallet)`. We intercept this dance.
+ *
+ * Strategy:
+ *   1. Dispatch our own app-ready event so already-loaded wallets register
+ *      with US first. We mutate their feature objects in place, so when
+ *      the real app receives them later, the patched versions are what
+ *      get used.
+ *   2. Listen for register-wallet events for wallets that load later
+ *      (race-safe).
+ *   3. As a belt-and-braces fallback, poll navigator.wallets every 500ms
+ *      and wrap anything we missed.
+ * ────────────────────────────────────────────────────────────────── */
+
+interface WalletStandardWallet {
+  name?: string;
+  features?: Record<string, unknown>;
+}
+
+interface WalletStandardApi {
+  register: (...wallets: WalletStandardWallet[]) => () => void;
+}
+
+const wrappedWallets = new WeakSet<WalletStandardWallet>();
+
+/** Wrap a single Wallet Standard feature method. Returns silently if not present. */
+function wrapWalletStandardMethod(
+  feature: unknown,
+  methodName: string,
+  intent: 'msg' | 'tx',
+): void {
+  if (!feature || typeof feature !== 'object') return;
+  const f = feature as Record<string, unknown>;
+  const original = f[methodName];
+  if (typeof original !== 'function') return;
+  if ((original as { __solshield_wrapped?: boolean }).__solshield_wrapped) return;
+
+  const orig = original as (...args: unknown[]) => unknown;
+  const wrapped = async function (this: unknown, ...inputs: unknown[]) {
+    try {
+      // Wallet Standard methods receive (...inputs) where each input has
+      // either `message: Uint8Array` (signMessage), `transaction: Uint8Array`
+      // (signTransaction), or `transaction: Uint8Array` (signAndSendTransaction).
+      // For SIWS (signIn), the input has domain/statement/nonce/etc fields.
+      const first = inputs[0] as Record<string, unknown> | undefined;
+      if (first) {
+        if (intent === 'msg') {
+          const message = first.message ?? siwsInputToBytes(first);
+          if (message instanceof Uint8Array) {
+            const requestId = newId();
+            window.postMessage(
+              {
+                type: 'analyze-message',
+                id: requestId,
+                data: { message: serializeMessage(message) },
+              } as InpageRequest,
+              '*',
+            );
+            const response = await waitForVerdict(requestId, 5000);
+            if (response.verdict?.verdict !== 'safe') {
+              throw createRejectionError();
+            }
+          }
+        } else {
+          const tx = first.transaction;
+          if (tx instanceof Uint8Array) {
+            const requestId = newId();
+            window.postMessage(
+              {
+                type: 'analyze-tx',
+                id: requestId,
+                data: { tx: bytesToBase64(tx) },
+              } as InpageRequest,
+              '*',
+            );
+            const response = await waitForVerdict(requestId, 5000);
+            if (response.verdict?.verdict !== 'safe') {
+              throw createRejectionError();
+            }
+          }
+        }
+      }
+      return orig.apply(this, inputs);
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err.message.includes('Verdict timeout') || err.message.includes('offline'))
+      ) {
+        console.warn('[SolShield] wallet-standard offline, failed open');
+        return orig.apply(this, inputs);
+      }
+      throw err;
+    }
+  };
+
+  Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
+  Object.defineProperty(wrapped, 'name', { value: orig.name });
+  Object.defineProperty(wrapped, 'toString', { value: () => orig.toString() });
+  f[methodName] = wrapped;
+}
+
+/** Reconstruct a SIWS message string from a wallet-standard signIn input. */
+function siwsInputToBytes(input: Record<string, unknown>): Uint8Array | undefined {
+  const domain = typeof input.domain === 'string' ? input.domain : undefined;
+  if (!domain) return undefined;
+
+  const lines: string[] = [`${domain} wants you to sign in with your Solana account:`];
+  if (typeof input.address === 'string') {
+    lines.push(input.address);
+  }
+  if (typeof input.statement === 'string') {
+    lines.push('', input.statement);
+  }
+  const meta: string[] = [];
+  if (typeof input.uri === 'string') meta.push(`URI: ${input.uri}`);
+  if (typeof input.version === 'string') meta.push(`Version: ${input.version}`);
+  if (typeof input.chainId === 'string') meta.push(`Chain ID: ${input.chainId}`);
+  if (typeof input.nonce === 'string') meta.push(`Nonce: ${input.nonce}`);
+  if (typeof input.issuedAt === 'string') meta.push(`Issued At: ${input.issuedAt}`);
+  if (meta.length > 0) lines.push('', ...meta);
+
+  return new TextEncoder().encode(lines.join('\n'));
+}
+
+function wrapWalletStandardWallet(wallet: WalletStandardWallet): void {
+  if (wrappedWallets.has(wallet)) return;
+  wrappedWallets.add(wallet);
+
+  const features = wallet.features;
+  if (!features || typeof features !== 'object') return;
+
+  // Each feature lives at a namespaced key. We monkey-patch its method in place.
+  wrapWalletStandardMethod(features['solana:signMessage'], 'signMessage', 'msg');
+  wrapWalletStandardMethod(features['solana:signTransaction'], 'signTransaction', 'tx');
+  wrapWalletStandardMethod(
+    features['solana:signAndSendTransaction'],
+    'signAndSendTransaction',
+    'tx',
+  );
+  wrapWalletStandardMethod(features['solana:signIn'], 'signIn', 'msg');
+}
+
+function setupWalletStandardHook(): void {
+  // Our API. Wallets call `register(wallet)` on this when they discover us.
+  const ourApi: WalletStandardApi = Object.freeze({
+    register: (...wallets: WalletStandardWallet[]) => {
+      wallets.forEach(wrapWalletStandardWallet);
+      // Return a no-op unregister — we don't need to actually unregister from our side.
+      return () => undefined;
+    },
+  });
+
+  // Listen for future wallet registration events. The wallet dispatches a
+  // `wallet-standard:register-wallet` event whose detail is a callback that
+  // expects to be called with `{ register }`.
+  try {
+    window.addEventListener('wallet-standard:register-wallet', (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (typeof detail === 'function') {
+        try {
+          detail(ourApi);
+        } catch {
+          // Swallow — never let our hook break the page.
+        }
+      }
+    });
+  } catch {
+    // If addEventListener fails for some reason, give up silently.
+  }
+
+  // Dispatch our own app-ready event so wallets that loaded BEFORE our content
+  // script will see us and call register on us. (This is the race-fix.)
+  try {
+    window.dispatchEvent(
+      new CustomEvent('wallet-standard:app-ready', { detail: ourApi }),
+    );
+  } catch {
+    // ignore
+  }
+
+  // Belt-and-braces: some apps construct their own getWallets() and only expose
+  // it via navigator.wallets. Poll and wrap anything we missed.
+  setInterval(() => {
+    const nav = navigator as unknown as { wallets?: { get?: () => readonly WalletStandardWallet[] } };
+    const reg = nav.wallets;
+    if (reg && typeof reg.get === 'function') {
+      try {
+        for (const w of reg.get()) wrapWalletStandardWallet(w);
+      } catch {
+        // ignore
+      }
+    }
+  }, 500);
+}
+
 // Start patching when script loads
 initProviderPatching();
+setupWalletStandardHook();
 
 export {};
