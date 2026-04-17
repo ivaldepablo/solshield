@@ -1,0 +1,29 @@
+node_modules
+.pnpm-store
+
+# env
+.env
+.env.local
+.env.*.local
+
+# build
+dist
+build
+.next
+out
+.turbo
+coverage
+
+# os
+.DS_Store
+Thumbs.db
+
+# editors
+.idea
+*.swp
+*.swo
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
