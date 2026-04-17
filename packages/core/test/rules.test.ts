@@ -11,11 +11,16 @@ import {
   STAKE,
   SYSTEM_PROGRAM,
   closeTokenAccountToAttacker,
+  computeBudgetAnomaly,
   hiddenSolTransfer,
   massTokenDrain,
+  memoExfiltration,
   mintAuthorityTransfer,
+  multisigCosignerManipulation,
   runRules,
   splAccountOwnerChange,
+  stakeAuthorityHijack,
+  tokenFreezeAbuse,
   unlimitedSplApproval,
   upgradeAuthoritySet,
 } from '../src/rules';
@@ -122,6 +127,21 @@ describe('mintAuthorityTransfer', () => {
           programId: SPL_TOKEN,
           accountIndexes: [1, 2],
           data: splSetAuthorityData(2, false),
+        },
+      ],
+    });
+    const findings = await mintAuthorityTransfer.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a freeze authority reassignment (covered by tokenFreezeAbuse)', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('mint'), key('current-auth'), SPL_TOKEN],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2],
+          data: splSetAuthorityData(1, true),
         },
       ],
     });
@@ -431,6 +451,320 @@ describe('closeTokenAccountToAttacker', () => {
   });
 });
 
+describe('tokenFreezeAbuse', () => {
+  it('flags a SetAuthority on FreezeAccount with a new authority', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('mint'), key('current-auth'), SPL_TOKEN],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2],
+          data: splSetAuthorityData(1, true),
+        },
+      ],
+    });
+    const findings = await tokenFreezeAbuse.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      ruleId: 'token-freeze-abuse',
+      severity: 'high',
+      instructionIndex: 0,
+    });
+  });
+
+  it('does not flag clearing the freeze authority', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('mint'), key('current-auth'), SPL_TOKEN],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2],
+          data: splSetAuthorityData(1, false),
+        },
+      ],
+    });
+    const findings = await tokenFreezeAbuse.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a mint authority change', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('mint'), key('current-auth'), SPL_TOKEN],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2],
+          data: splSetAuthorityData(0, true),
+        },
+      ],
+    });
+    const findings = await tokenFreezeAbuse.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+});
+
+// Stake Authorize layout: [disc:u32 LE, newAuthority:Pubkey(32), stakeAuthorize:u32 LE]
+function stakeAuthorizeData(stakeAuthorize: number): Uint8Array {
+  return concat(u32LE(1), new Uint8Array(32), u32LE(stakeAuthorize));
+}
+
+// Stake AuthorizeChecked layout: [disc:u32 LE, stakeAuthorize:u32 LE]
+function stakeAuthorizeCheckedData(stakeAuthorize: number): Uint8Array {
+  return concat(u32LE(10), u32LE(stakeAuthorize));
+}
+
+describe('stakeAuthorityHijack', () => {
+  it('marks a withdrawer reassignment as critical', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('stake-account'), key('current-auth'), STAKE],
+      instructions: [
+        {
+          programId: STAKE,
+          accountIndexes: [1, 2],
+          data: stakeAuthorizeData(1),
+        },
+      ],
+    });
+    const findings = await stakeAuthorityHijack.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      ruleId: 'stake-authority-hijack',
+      severity: 'critical',
+      instructionIndex: 0,
+    });
+  });
+
+  it('marks a staker reassignment as high', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('stake-account'), key('current-auth'), STAKE],
+      instructions: [
+        {
+          programId: STAKE,
+          accountIndexes: [1, 2],
+          data: stakeAuthorizeData(0),
+        },
+      ],
+    });
+    const findings = await stakeAuthorityHijack.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      ruleId: 'stake-authority-hijack',
+      severity: 'high',
+    });
+  });
+
+  it('also flags AuthorizeChecked variant', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('stake-account'), key('current-auth'), STAKE],
+      instructions: [
+        {
+          programId: STAKE,
+          accountIndexes: [1, 2],
+          data: stakeAuthorizeCheckedData(1),
+        },
+      ],
+    });
+    const findings = await stakeAuthorityHijack.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    const details = findings[0]?.details as { variant: string };
+    expect(details.variant).toBe('checked');
+  });
+
+  it('does not flag unrelated stake instructions', async () => {
+    // disc 3 = Withdraw, not Authorize.
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('stake-account'), STAKE],
+      instructions: [
+        {
+          programId: STAKE,
+          accountIndexes: [1],
+          data: concat(u32LE(3), u64LE(1_000n)),
+        },
+      ],
+    });
+    const findings = await stakeAuthorityHijack.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+});
+
+describe('memoExfiltration', () => {
+  it('flags a memo payload above the size threshold', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), MEMO],
+      instructions: [
+        {
+          programId: MEMO,
+          accountIndexes: [],
+          // 500 printable 'a' characters.
+          data: Uint8Array.from({ length: 500 }, () => 0x61),
+        },
+      ],
+    });
+    const findings = await memoExfiltration.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      ruleId: 'memo-exfiltration',
+      severity: 'low',
+      instructionIndex: 0,
+    });
+    const details = findings[0]?.details as { length: number };
+    expect(details.length).toBe(500);
+  });
+
+  it('flags a memo payload with high non-printable ratio', async () => {
+    // 100 bytes, 80 of which are 0x00 (non-printable).
+    const bytes = new Uint8Array(100);
+    for (let i = 80; i < 100; i++) bytes[i] = 0x41;
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), MEMO],
+      instructions: [{ programId: MEMO, accountIndexes: [], data: bytes }],
+    });
+    const findings = await memoExfiltration.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    const details = findings[0]?.details as { nonPrintableRatio: number };
+    expect(details.nonPrintableRatio).toBeCloseTo(0.8, 5);
+  });
+
+  it('does not flag a short, human-readable memo', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), MEMO],
+      instructions: [
+        {
+          programId: MEMO,
+          accountIndexes: [],
+          data: new TextEncoder().encode('Order #1234 — thanks!'),
+        },
+      ],
+    });
+    const findings = await memoExfiltration.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+});
+
+// SetComputeUnitLimit: [disc:u8=2, limit:u32 LE]
+function cuLimitData(limit: number): Uint8Array {
+  return concat(u8Data(2), u32LE(limit));
+}
+
+// SetComputeUnitPrice: [disc:u8=3, microLamports:u64 LE]
+function cuPriceData(microLamports: bigint): Uint8Array {
+  return concat(u8Data(3), u64LE(microLamports));
+}
+
+describe('computeBudgetAnomaly', () => {
+  it('flags a near-max CU limit paired with zero priority fee', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), COMPUTE_BUDGET],
+      instructions: [
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuLimitData(1_400_000) },
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuPriceData(0n) },
+      ],
+    });
+    const findings = await computeBudgetAnomaly.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      ruleId: 'compute-budget-anomaly',
+      severity: 'low',
+    });
+    const details = findings[0]?.details as { instructionIndexes: number[]; limit: number };
+    expect(details.instructionIndexes).toEqual([0, 1]);
+    expect(details.limit).toBe(1_400_000);
+  });
+
+  it('does not flag a high CU limit when the priority fee is non-zero', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), COMPUTE_BUDGET],
+      instructions: [
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuLimitData(1_400_000) },
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuPriceData(1_000n) },
+      ],
+    });
+    const findings = await computeBudgetAnomaly.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a modest CU limit even with zero priority fee', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), COMPUTE_BUDGET],
+      instructions: [
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuLimitData(200_000) },
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuPriceData(0n) },
+      ],
+    });
+    const findings = await computeBudgetAnomaly.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+});
+
+describe('multisigCosignerManipulation', () => {
+  it('flags an account-owner change with four or more accounts (multisig-like)', async () => {
+    const tx = mockTx({
+      accountKeys: [
+        key('fee-payer'),
+        key('token-account'),
+        key('multisig-owner'),
+        key('signer-a'),
+        key('signer-b'),
+        key('signer-c'),
+        SPL_TOKEN,
+      ],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2, 3, 4, 5],
+          data: splSetAuthorityData(2, true),
+        },
+      ],
+    });
+    const findings = await multisigCosignerManipulation.evaluate(ctx(tx));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      ruleId: 'multisig-cosigner-manipulation',
+      severity: 'critical',
+      instructionIndex: 0,
+    });
+    const details = findings[0]?.details as { accountCount: number };
+    expect(details.accountCount).toBe(5);
+  });
+
+  it('does not flag a plain two-account SetAuthority on AccountOwner', async () => {
+    const tx = mockTx({
+      accountKeys: [key('fee-payer'), key('token-account'), key('current-owner'), SPL_TOKEN],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2],
+          data: splSetAuthorityData(2, true),
+        },
+      ],
+    });
+    const findings = await multisigCosignerManipulation.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a multisig-shaped mint authority change', async () => {
+    const tx = mockTx({
+      accountKeys: [
+        key('fee-payer'),
+        key('mint'),
+        key('ms-owner'),
+        key('signer-a'),
+        key('signer-b'),
+        SPL_TOKEN,
+      ],
+      instructions: [
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2, 3, 4],
+          data: splSetAuthorityData(0, true),
+        },
+      ],
+    });
+    const findings = await multisigCosignerManipulation.evaluate(ctx(tx));
+    expect(findings).toHaveLength(0);
+  });
+});
+
 describe('runRules', () => {
   it('returns a safe verdict on a benign transaction', async () => {
     const tx = mockTx({
@@ -473,5 +807,48 @@ describe('runRules', () => {
     const severities = report.findings.map((f) => f.severity);
     expect(severities).toContain('critical');
     expect(severities).toContain('high');
+  });
+});
+
+describe('runRules (multiple findings)', () => {
+  it('aggregates several distinct rule hits in one transaction', async () => {
+    // Critical: multisig cosigner manipulation + spl-account-owner-change
+    //           on a 5-account SetAuthority(AccountOwner).
+    // High:     token freeze authority transfer.
+    // Low:      compute-budget anomaly (near-max CU + zero price).
+    const tx = mockTx({
+      accountKeys: [
+        key('fee-payer'),
+        key('token-account'),
+        key('multisig-owner'),
+        key('signer-a'),
+        key('signer-b'),
+        key('signer-c'),
+        key('mint'),
+        key('freeze-auth'),
+        SPL_TOKEN,
+        COMPUTE_BUDGET,
+      ],
+      instructions: [
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuLimitData(1_400_000) },
+        { programId: COMPUTE_BUDGET, accountIndexes: [], data: cuPriceData(0n) },
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [1, 2, 3, 4, 5],
+          data: splSetAuthorityData(2, true),
+        },
+        {
+          programId: SPL_TOKEN,
+          accountIndexes: [6, 7],
+          data: splSetAuthorityData(1, true),
+        },
+      ],
+    });
+    const report = await runRules(ctx(tx), BUILTIN_RULES);
+    const ruleIds = new Set(report.findings.map((f) => f.ruleId));
+    expect(report.findings.length).toBeGreaterThanOrEqual(3);
+    expect(ruleIds.size).toBeGreaterThanOrEqual(3);
+    expect(report.verdict).toBe('danger');
+    expect(report.score).toBeGreaterThanOrEqual(90);
   });
 });
