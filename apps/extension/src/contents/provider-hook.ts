@@ -439,17 +439,29 @@ function createProxyFn(
 /**
  * Install a "sticky" wrapped method on a provider — even if the dapp / SDK
  * later tries to reassign the property, our setter re-wraps the new value.
- * This is what defeats Dynamic / Privy / Reown style abstraction layers that
- * cache and replace wallet methods at connection time.
+ * Returns true iff we successfully installed (so /diagnostic can report
+ * accurately instead of lying that we patched when we didn't).
  */
 function installStickyProxy(
   provider: Record<string, unknown>,
   methodName: 'signTransaction' | 'signAllTransactions' | 'signMessage',
-): void {
-  const original = provider[methodName];
-  if (typeof original !== 'function') return;
+  label: string,
+): boolean {
+  let original: unknown;
+  try {
+    original = provider[methodName];
+  } catch (err) {
+    logEvent('warn', 'install-sticky', `${label}.${methodName}: read threw — ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+  if (typeof original !== 'function') {
+    logEvent('warn', 'install-sticky', `${label}.${methodName}: not a function (${typeof original})`);
+    return false;
+  }
 
   let wrapped = createProxyFn(original as (...args: unknown[]) => unknown, methodName);
+  // Mark wrapper so /diagnostic test can verify identity.
+  Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
 
   try {
     Object.defineProperty(provider, methodName, {
@@ -461,22 +473,35 @@ function installStickyProxy(
         // Wrap the new function and keep them happy.
         if (typeof newValue === 'function') {
           wrapped = createProxyFn(newValue as (...args: unknown[]) => unknown, methodName);
+          Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
         } else {
           wrapped = newValue as never;
         }
       },
     });
-  } catch {
-    // Property is non-configurable for some reason — fall back to direct assignment.
-    provider[methodName] = wrapped;
+    logEvent('info', 'install-sticky', `${label}.${methodName} installed via defineProperty`);
+    return true;
+  } catch (err) {
+    // Property non-configurable — try direct assignment.
+    try {
+      provider[methodName] = wrapped;
+      logEvent('info', 'install-sticky', `${label}.${methodName} installed via direct assignment`);
+      return true;
+    } catch (err2) {
+      logEvent('err', 'install-sticky', `${label}.${methodName} BOTH failed — defineProperty: ${err instanceof Error ? err.message : String(err)} | assignment: ${err2 instanceof Error ? err2.message : String(err2)}`);
+      return false;
+    }
   }
 }
 
-/** Patch a provider object's signing methods (wallet-standard-agnostic legacy hook). */
+/** Patch a provider object's signing methods (wallet-standard-agnostic legacy hook).
+ *  Only marks the hook flag if at least one method was successfully patched. */
 function patchProvider(provider: Record<string, unknown>, label: string): void {
-  installStickyProxy(provider, 'signTransaction');
-  installStickyProxy(provider, 'signAllTransactions');
-  installStickyProxy(provider, 'signMessage');
+  const okTx = installStickyProxy(provider, 'signTransaction', label);
+  const okTxs = installStickyProxy(provider, 'signAllTransactions', label);
+  const okMsg = installStickyProxy(provider, 'signMessage', label);
+  const anyPatched = okTx || okTxs || okMsg;
+  if (!anyPatched) return;
 
   const status = ensureStatus();
   if (label === 'window.solana') status.hooks.legacyWindowSolana = true;

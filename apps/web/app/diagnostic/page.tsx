@@ -106,25 +106,32 @@ export default function Diagnostic() {
   const runInterceptionTest = useCallback(async () => {
     setInterceptionTest({ state: 'running' });
     try {
-      const w = window as unknown as { solana?: { signMessage?: (b: Uint8Array) => Promise<unknown> } };
+      const w = window as unknown as {
+        solana?: { signMessage?: ((b: Uint8Array) => Promise<unknown>) & { __solshield_wrapped?: boolean } };
+      };
       if (!w.solana?.signMessage) {
         setInterceptionTest({
           state: 'missed',
-          detail: 'no window.solana found — install Phantom or use Phantom dev profile',
+          detail:
+            'no window.solana.signMessage found — Phantom 2025+ does not always expose it on window.solana anymore. The wallet-standard path (modern API, 5 wallets wrapped above) is what real dapps use. This legacy test is informational only.',
         });
         return;
       }
 
+      // Identity check — is the function we got actually our wrapper?
+      const fnSrc = w.solana.signMessage.toString();
+      const isMarked = w.solana.signMessage.__solshield_wrapped === true;
+
       const before = (window as unknown as { __solshield?: SolShieldStatus }).__solshield
         ?.interceptions.total ?? 0;
 
-      // Fire a sign request
       const malicious =
         'phishy-jup.xyz wants you to sign in with your Solana account:\n\nURI: https://jup.ag\nNonce: diagnostic-test';
       const bytes = new TextEncoder().encode(malicious);
 
       let caught = false;
       let signResult: unknown;
+      let signError: string | null = null;
       try {
         signResult = await Promise.race([
           w.solana.signMessage(bytes),
@@ -132,27 +139,39 @@ export default function Diagnostic() {
         ]);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.toLowerCase().includes('reject')) {
-          caught = true;
-        }
+        signError = msg;
+        if (msg.toLowerCase().includes('reject')) caught = true;
       }
 
       const after = (window as unknown as { __solshield?: SolShieldStatus }).__solshield
         ?.interceptions.total ?? 0;
 
+      const idLine = isMarked
+        ? '✓ identity: wrapper is OURS (__solshield_wrapped=true)'
+        : `✗ identity: wrapper is NOT ours — fn source starts with: ${fnSrc.slice(0, 120)}`;
+
       if (after > before) {
         setInterceptionTest({
           state: 'caught',
-          detail: `interception counter went ${before} → ${after}. ${
-            caught ? 'You rejected — perfect.' : 'Wallet signed (you accepted, or extension failed open).'
+          detail: `${idLine}\ncounter ${before} → ${after}. ${
+            caught
+              ? 'You rejected — perfect.'
+              : signError
+                ? `error: ${signError}`
+                : 'Signed (you accepted, or fail-open).'
           }`,
+        });
+      } else if (!isMarked) {
+        setInterceptionTest({
+          state: 'missed',
+          detail: `${idLine}\nthe extension hooked window.solana but something replaced the function later. Phantom may inject signMessage via a getter that we can't override. The wallet-standard path (above) is the real protection on Phantom 2025+.`,
         });
       } else {
         setInterceptionTest({
           state: 'missed',
-          detail: `wallet returned ${
-            signResult === undefined ? 'undefined' : 'a result'
-          } but the interception counter did NOT increment. The extension did not see this call — bypass detected.`,
+          detail: `${idLine}\nour wrapper IS installed but the counter did not move. signResult=${
+            signResult === undefined ? 'undefined' : typeof signResult
+          }, error=${signError ?? 'none'}. Possible: overlay-mount didn't respond; check that extension service worker is alive.`,
         });
       }
     } catch (err) {
