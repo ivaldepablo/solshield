@@ -22,7 +22,8 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.8';
+const SOLSHIELD_VERSION = '0.1.9';
+const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -197,7 +198,7 @@ window.addEventListener(
     if (!data || typeof data !== 'object' || !('id' in data)) return;
 
     // Skip our own outgoing requests — they have a `type` field, responses don't.
-    if ('type' in (data as Record<string, unknown>)) return;
+    if ('type' in (data as unknown as Record<string, unknown>)) return;
 
     // Must be a response from overlay-mount — has verdict or error.
     if (!('verdict' in data) && !('error' in data)) return;
@@ -332,13 +333,13 @@ function createProxyFn(
             type: 'analyze-tx',
             id: requestId,
             data: { tx: txBase64 },
-            timeout: 5000,
+            timeout: VERDICT_TIMEOUT_MS,
           } as InpageRequest,
           '*'
         );
 
         // Wait for verdict
-        const response = await waitForVerdict(requestId, 5000);
+        const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
 
         const v = response.verdict?.verdict ?? 'unknown';
         recordInterception('tx', v as 'safe' | 'suspicious' | 'danger' | 'unknown');
@@ -366,12 +367,12 @@ function createProxyFn(
               type: 'analyze-tx',
               id: requestId,
               data: { tx: txBase64 },
-              timeout: 5000,
+              timeout: VERDICT_TIMEOUT_MS,
             } as InpageRequest,
             '*'
           );
 
-          const response = await waitForVerdict(requestId, 5000);
+          const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
           const v = response.verdict?.verdict ?? 'unknown';
           recordInterception('tx', v as 'safe' | 'suspicious' | 'danger' | 'unknown');
           logEvent('info', 'verdict', `legacy txs[] → ${v}`);
@@ -403,12 +404,12 @@ function createProxyFn(
             type: 'analyze-message',
             id: requestId,
             data: { message: msgUtf8 },
-            timeout: 5000,
+            timeout: VERDICT_TIMEOUT_MS,
           } as InpageRequest,
           '*'
         );
 
-        const response = await waitForVerdict(requestId, 5000);
+        const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
         const v = response.verdict?.verdict ?? 'unknown';
         recordInterception('msg', v as 'safe' | 'suspicious' | 'danger' | 'unknown');
         logEvent('info', 'verdict', `legacy msg → ${v}`);
@@ -463,12 +464,13 @@ function installStickyProxy(
     return false;
   }
   if (typeof original !== 'function') {
-    logEvent('warn', 'install-sticky', `${label}.${methodName}: not a function (${typeof original})`);
     return false;
   }
+  // Already our wrapper — skip silently. The polling loop re-runs every 100ms
+  // and we don't want to spam the log or re-wrap our own wrapper on each pass.
+  if ((original as { __solshield_wrapped?: boolean }).__solshield_wrapped) return true;
 
   let wrapped = createProxyFn(original as (...args: unknown[]) => unknown, methodName);
-  // Mark wrapper so /diagnostic test can verify identity.
   Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
 
   try {
@@ -477,11 +479,16 @@ function installStickyProxy(
       enumerable: true,
       get: () => wrapped,
       set: (newValue: unknown) => {
-        // Someone (likely Dynamic / Privy) is trying to swap our wrapper out.
-        // Wrap the new function and keep them happy.
         if (typeof newValue === 'function') {
-          wrapped = createProxyFn(newValue as (...args: unknown[]) => unknown, methodName);
-          Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
+          // If the incoming value is already wrapped, keep it as-is to avoid
+          // double-wrapping when SDKs round-trip the same fn through us.
+          if ((newValue as { __solshield_wrapped?: boolean }).__solshield_wrapped) {
+            wrapped = newValue as typeof wrapped;
+          } else {
+            wrapped = createProxyFn(newValue as (...args: unknown[]) => unknown, methodName);
+            Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
+            logEvent('info', 'install-sticky', `${label}.${methodName} re-wrapped after SDK reassigned`);
+          }
         } else {
           wrapped = newValue as never;
         }
@@ -490,7 +497,6 @@ function installStickyProxy(
     logEvent('info', 'install-sticky', `${label}.${methodName} installed via defineProperty`);
     return true;
   } catch (err) {
-    // Property non-configurable — try direct assignment.
     try {
       provider[methodName] = wrapped;
       logEvent('info', 'install-sticky', `${label}.${methodName} installed via direct assignment`);
@@ -624,7 +630,7 @@ function wrapWalletStandardMethod(
               } as InpageRequest,
               '*',
             );
-            const response = await waitForVerdict(requestId, 5000);
+            const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
             const v = response.verdict?.verdict ?? 'unknown';
             recordInterception(
               methodName === 'signIn' ? 'wallet-standard-signin' : 'wallet-standard-msg',
@@ -647,7 +653,7 @@ function wrapWalletStandardMethod(
               } as InpageRequest,
               '*',
             );
-            const response = await waitForVerdict(requestId, 5000);
+            const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
             const v = response.verdict?.verdict ?? 'unknown';
             recordInterception(
               'wallet-standard-tx',
@@ -959,7 +965,7 @@ function wrapSigningInvocation(
               '*',
             );
             logEvent('info', 'await-verdict', `requestId=${requestId} waiting…`);
-            const response = await waitForVerdict(requestId, 5000);
+            const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
             logEvent('info', 'await-verdict', `requestId=${requestId} resolved`);
             const v = response.verdict?.verdict ?? 'unknown';
             recordInterception(
@@ -986,7 +992,7 @@ function wrapSigningInvocation(
               } as InpageRequest,
               '*',
             );
-            const response = await waitForVerdict(requestId, 5000);
+            const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
             const v = response.verdict?.verdict ?? 'unknown';
             recordInterception(
               'wallet-standard-tx',

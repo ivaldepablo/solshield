@@ -6,24 +6,15 @@
   </head>
   <body>
     <h1>SolShield e2e test fixture</h1>
-    <p>This page simulates a Phantom-like wallet via Wallet Standard so we can
-       run the extension end-to-end without a real wallet.</p>
     <pre id="result">running…</pre>
     <script>
-      // Wait for the extension to inject its hooks (run_at: document_start
-      // means the hook should be ready by the time DOMContentLoaded fires,
-      // but the scripting.registerContentScripts path may take an extra tick).
       const log = (msg) => {
         document.getElementById('result').textContent += '\n' + msg;
       };
 
-      function makeFakeWallet() {
-        const realSignMessage = async (input) => ({
-          signedMessage: input.message,
-          signature: new Uint8Array([1, 2, 3, 4]),
-        });
+      function makeFakeWallet(name) {
         return {
-          name: 'TestPhantom',
+          name,
           version: '1.0.0',
           icon: 'data:image/svg+xml;base64,PHN2Zy8+',
           chains: ['solana:mainnet'],
@@ -33,49 +24,41 @@
             'standard:disconnect': { version: '1.0.0', disconnect: async () => {} },
             'solana:signMessage': {
               version: '1.0.0',
-              signMessage: realSignMessage,
+              signMessage: async (input) => ({
+                signedMessage: input.message,
+                signature: new Uint8Array([1, 2, 3, 4]),
+              }),
             },
           },
         };
       }
 
-      async function run() {
-        // Give extension time to install hooks
-        await new Promise((r) => setTimeout(r, 500));
+      function installLegacyWindowSolana() {
+        // Simulate Phantom-style window.solana (it's defined as an object
+        // with signTransaction / signAllTransactions / signMessage).
+        Object.defineProperty(window, 'solana', {
+          configurable: true,
+          enumerable: true,
+          value: {
+            isPhantom: true,
+            isConnected: true,
+            publicKey: { toBase58: () => 'TEST_PUBLIC_KEY' },
+            signMessage: async (bytes) => ({
+              signature: new Uint8Array([5, 6, 7, 8]),
+              publicKey: 'TEST_PUBLIC_KEY',
+            }),
+            signTransaction: async (tx) => tx,
+            signAllTransactions: async (txs) => txs,
+          },
+        });
+      }
 
-        const status = (window).__solshield;
-        if (!status) {
-          log('FAIL: extension did not load (window.__solshield missing)');
-          window.__solshieldTestResult = { ok: false, reason: 'no-extension' };
-          return;
-        }
-        log('extension v' + status.version + ' loaded');
-        log('safeMode: ' + status.safeMode);
+      async function runScenarioWalletStandard(name, payload) {
+        log(`\n--- scenario [${name}] ---`);
+        const wallet = makeFakeWallet('TestPhantom_' + name);
+        const walletCallback = (api) => api.register(wallet);
 
-        // SCENARIO: simulate a real wallet-standard handshake.
-        // 1. The "wallet" is loaded first and registers itself via the
-        //    `wallet-standard:register-wallet` event whose callback is a fn
-        //    that receives a registry api, on which it calls register(wallet).
-        // 2. The dApp comes later and dispatches `wallet-standard:app-ready`,
-        //    listening for register-wallet via its OWN handler too.
-        const wallet = makeFakeWallet();
-
-        // The wallet's "callback" — receives an api, calls api.register(wallet)
-        const walletCallback = (api) => {
-          api.register(wallet);
-        };
-
-        // The wallet "fires" register-wallet so any listener (us OR the dapp)
-        // can connect to it.
-        window.dispatchEvent(
-          new CustomEvent('wallet-standard:register-wallet', { detail: walletCallback }),
-        );
-
-        // Now the dapp comes online. It dispatches app-ready to discover any
-        // wallet that loaded after the dapp script ran. AND it sets up its
-        // own listener for register-wallet so it catches wallets that loaded
-        // before the dapp (which is what most real dapps do via @wallet-standard/app).
-        window.__appReceivedWallets = [];
+        window.__appReceivedWallets = window.__appReceivedWallets || [];
         const dappRegistry = {
           register: (...wallets) => {
             window.__appReceivedWallets.push(...wallets);
@@ -83,95 +66,173 @@
           },
         };
 
-        // Listen for register-wallet (catches future wallets) — and re-fire
-        // the SAME wallet so the dapp also picks it up.
-        window.addEventListener('wallet-standard:register-wallet', (event) => {
-          const cb = event.detail;
-          if (typeof cb === 'function') cb(dappRegistry);
-        });
+        // Listen for register-wallet so the dapp can also see the wallet
+        const listener = (event) => {
+          if (typeof event.detail === 'function') event.detail(dappRegistry);
+        };
+        window.addEventListener('wallet-standard:register-wallet', listener);
 
         window.dispatchEvent(
           new CustomEvent('wallet-standard:app-ready', { detail: dappRegistry }),
         );
-
-        // Re-fire register-wallet now that the dapp's listener is set up
-        // (the wallet was registered before the listener existed).
         window.dispatchEvent(
           new CustomEvent('wallet-standard:register-wallet', { detail: walletCallback }),
         );
 
-        // Give wraps time to register
         await new Promise((r) => setTimeout(r, 200));
 
-        const status2 = (window).__solshield;
-        log('wallets wrapped: ' + status2.hooks.walletStandardWallets);
-        log('wallet names: ' + JSON.stringify(status2.walletNames));
-        log('events in log: ' + status2.log.length);
+        const dappWallet = window.__appReceivedWallets[window.__appReceivedWallets.length - 1];
+        if (!dappWallet) {
+          log(`FAIL: dapp didn't receive wallet`);
+          return { ok: false };
+        }
 
-        const dappWallets = window.__appReceivedWallets || [];
-        if (dappWallets.length === 0) {
-          log('FAIL: no wallets reached the dapp register');
-          window.__solshieldTestResult = { ok: false, reason: 'no-dapp-wallets', log: status2.log };
+        const status = window.__solshield;
+        const before = status.interceptions.total;
+        const t0 = performance.now();
+
+        const signFn = dappWallet.features['solana:signMessage'].signMessage;
+        let result, error;
+        try {
+          result = await Promise.race([
+            signFn({ message: payload }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('hard-timeout-15s')), 15000)),
+          ]);
+        } catch (e) {
+          error = e.message;
+        }
+
+        const elapsed = Math.round(performance.now() - t0);
+        const status2 = window.__solshield;
+        const after = status2.interceptions.total;
+        log(`elapsed: ${elapsed}ms, intercepts ${before}→${after}, error=${error || 'none'}`);
+
+        window.removeEventListener('wallet-standard:register-wallet', listener);
+        return {
+          ok: after > before,
+          elapsed,
+          before,
+          after,
+          error,
+          gotResult: result !== undefined,
+        };
+      }
+
+      async function runScenarioLegacy(name, payload) {
+        log(`\n--- scenario [${name}] ---`);
+        // Wait for hooks to be installed (initProviderPatching polls every 100ms)
+        await new Promise((r) => setTimeout(r, 600));
+
+        const status = window.__solshield;
+        if (!status.hooks.legacyWindowSolana) {
+          log(`FAIL: window.solana hook not installed (was: ${status.hooks.legacyWindowSolana})`);
+          return { ok: false };
+        }
+
+        const before = status.interceptions.total;
+        const t0 = performance.now();
+
+        let result, error;
+        try {
+          result = await Promise.race([
+            window.solana.signMessage(payload),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('hard-timeout-15s')), 15000)),
+          ]);
+        } catch (e) {
+          error = e.message;
+        }
+
+        const elapsed = Math.round(performance.now() - t0);
+        const status2 = window.__solshield;
+        const after = status2.interceptions.total;
+        log(`elapsed: ${elapsed}ms, intercepts ${before}→${after}, error=${error || 'none'}`);
+
+        return {
+          ok: after > before,
+          elapsed,
+          before,
+          after,
+          error,
+          gotResult: result !== undefined,
+        };
+      }
+
+      async function run() {
+        await new Promise((r) => setTimeout(r, 500));
+
+        const status = window.__solshield;
+        if (!status) {
+          log('FAIL: extension did not load');
+          window.__solshieldTestResult = { ok: false, reason: 'no-extension' };
           return;
         }
+        log('extension v' + status.version + ' loaded');
 
-        const w = dappWallets[0];
-        log('dapp received wallet: ' + w.name);
+        installLegacyWindowSolana();
+        log('installed fake window.solana');
 
-        const signFn = w.features['solana:signMessage'].signMessage;
-        log('signFn type: ' + typeof signFn);
-
-        const beforeIntercepts = status2.interceptions.total;
-        log('intercepts before: ' + beforeIntercepts);
-
-        const message = new TextEncoder().encode('phishy.xyz wants you to sign in...');
-
-        // Race signFn against a hard timeout so we don't hang forever — and
-        // periodically log the extension's view of what's happening.
-        const monitor = setInterval(() => {
-          const cur = (window).__solshield;
-          log(`[monitor t+${Math.round(performance.now())}ms] events=${cur.log.length} intercepts=${cur.interceptions.total}`);
-        }, 1500);
-
-        const hardTimeout = new Promise((_, rej) =>
-          setTimeout(() => rej(new Error('hard timeout 12s')), 12000),
+        // Truly safe — no URLs, no suspicious patterns. API should return safe.
+        const safeMsg = new TextEncoder().encode(
+          'Sign this message to authenticate your account. Nonce: ' + Math.random(),
+        );
+        // Has phishing patterns (suspicious URL, drainer language). API should flag this.
+        // For the test, after our overlay is shown we'll auto-click it via the autoclick code below.
+        const phishyMsg = new TextEncoder().encode(
+          'wallet-drainer.xyz/airdrop wants you to approve signTransaction transferring all your SOL — claim now!',
         );
 
-        try {
-          const result = await Promise.race([signFn({ message }), hardTimeout]);
-          log('signFn returned: ' + JSON.stringify(result));
-        } catch (e) {
-          log('signFn threw: ' + e.message);
-        } finally {
-          clearInterval(monitor);
-        }
-
-        const status3 = (window).__solshield;
-        const afterIntercepts = status3.interceptions.total;
-        log('intercepts after: ' + afterIntercepts);
-        log('events in log after: ' + status3.log.length);
-
-        // Print last 5 events
-        log('\n--- last 5 log events ---');
-        status3.log.slice(-5).forEach((e) => {
-          log(`[${e.level}] ${e.tag}: ${e.msg}`);
+        // Auto-click the overlay's REJECT button when it appears, so the test
+        // doesn't hang on user input. This proves the overlay was rendered AND
+        // that our wrapper handles user-rejection correctly.
+        const observer = new MutationObserver(() => {
+          const host = document.getElementById('solshield-overlay-host');
+          if (!host) return;
+          const root = host.shadowRoot;
+          if (!root) return;
+          // Find any button labelled like "reject" / "block" / "cancel".
+          const buttons = root.querySelectorAll('button');
+          for (const btn of buttons) {
+            const txt = (btn.textContent || '').toLowerCase();
+            if (txt.includes('reject') || txt.includes('block') || txt.includes('cancel')) {
+              log('autoclick: clicking overlay button "' + btn.textContent + '"');
+              btn.click();
+              return;
+            }
+          }
         });
+        observer.observe(document.body, { childList: true, subtree: true });
 
-        const wasIntercepted = afterIntercepts > beforeIntercepts;
+        const results = {};
+        results.walletStandardSafe = await runScenarioWalletStandard('ws-safe', safeMsg);
+        results.walletStandardPhishy = await runScenarioWalletStandard('ws-phishy', phishyMsg);
+        results.legacySafe = await runScenarioLegacy('legacy-safe', safeMsg);
+        results.legacyPhishy = await runScenarioLegacy('legacy-phishy', phishyMsg);
+
+        const finalStatus = window.__solshield;
+        log('\n--- final status ---');
+        log('total intercepts: ' + finalStatus.interceptions.total);
+        log('flagged: ' + finalStatus.interceptions.flagged);
+        log('safe: ' + finalStatus.interceptions.safe);
+        log('failed-open: ' + finalStatus.interceptions.failedOpen);
+        log('errors: ' + finalStatus.errors.length);
+
+        const allOk = Object.values(results).every((r) => r.ok);
+
         window.__solshieldTestResult = {
-          ok: wasIntercepted,
-          beforeIntercepts,
-          afterIntercepts,
-          log: status3.log,
-          walletNames: status3.walletNames,
-          walletsWrapped: status3.hooks.walletStandardWallets,
-          errors: status3.errors,
+          ok: allOk,
+          scenarios: results,
+          finalStatus: {
+            interceptions: finalStatus.interceptions,
+            errors: finalStatus.errors,
+            walletNames: finalStatus.walletNames,
+          },
+          log: finalStatus.log,
         };
       }
 
       run().catch((e) => {
         log('SCRIPT ERROR: ' + e.message);
-        window.__solshieldTestResult = { ok: false, reason: 'script-error', error: e.message };
+        window.__solshieldTestResult = { ok: false, error: e.message };
       });
     </script>
   </body>

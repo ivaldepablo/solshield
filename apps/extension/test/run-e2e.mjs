@@ -78,6 +78,30 @@ async function main() {
   // Give the SW time to register dynamic MAIN-world content scripts.
   await new Promise((r) => setTimeout(r, 2000));
 
+  // Warm up the API + service worker by hitting the production endpoints
+  // directly from a throwaway context so the extension's first real call
+  // doesn't pay the cold-start cost.
+  log('warming up API + service worker…');
+  const warmupPage = await context.newPage();
+  await warmupPage.goto('https://solshield.dev');
+  await warmupPage.evaluate(async () => {
+    try {
+      await Promise.all([
+        fetch('https://solshield.dev/api/check-domain', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ url: 'jup.ag' }),
+        }),
+        fetch('https://solshield.dev/api/inspect-message', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ message: 'warmup', encoding: 'utf8' }),
+        }),
+      ]);
+    } catch {}
+  });
+  await warmupPage.close();
+
   const page = await context.newPage();
   page.on('console', (msg) => log(`page console [${msg.type()}]:`, msg.text()));
   page.on('pageerror', (err) => log(`page error:`, err.message));
@@ -108,18 +132,24 @@ async function main() {
     process.exit(1);
   }
 
-  log('test result:', JSON.stringify({ ok: result.ok, before: result.beforeIntercepts, after: result.afterIntercepts, walletsWrapped: result.walletsWrapped, walletNames: result.walletNames }, null, 2));
+  log('overall ok: ' + result.ok);
+  if (result.scenarios) {
+    log('scenarios:');
+    for (const [name, r] of Object.entries(result.scenarios)) {
+      log(`  - ${name}: ok=${r.ok} elapsed=${r.elapsed}ms intercepts=${r.before}→${r.after} error=${r.error || 'none'}`);
+    }
+  }
 
-  if (result.errors && result.errors.length > 0) {
+  if (result.finalStatus?.errors?.length > 0) {
     log('errors recorded by extension:');
-    for (const e of result.errors) {
+    for (const e of result.finalStatus.errors) {
       log(`  - [${e.phase}] ${e.message}`);
     }
   }
 
   if (result.log) {
-    log('extension event log:');
-    for (const e of result.log) {
+    log('extension event log (last 30):');
+    for (const e of result.log.slice(-30)) {
       log(`  [${e.level}] ${e.tag}: ${e.msg}`);
     }
   }

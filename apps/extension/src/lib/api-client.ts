@@ -6,7 +6,10 @@
 import type { VerdictView, Finding } from './messaging';
 
 const API_BASE = 'https://solshield.dev/api';
-const TIMEOUT_MS = 5000;
+// Server can be slow to wake up (cold start). Wrapper timeout is 10s,
+// so leave headroom for the full request roundtrip including service-worker
+// startup, DNS, TLS, and the actual API processing.
+const TIMEOUT_MS = 8000;
 
 interface ApiTxResponse {
   verdict: 'safe' | 'suspicious' | 'danger';
