@@ -28,6 +28,15 @@ export default function Popup() {
   const [totalScans, setTotalScans] = useState(0);
   const [threatsBlocked, setThreatsBlocked] = useState(0);
   const [recentActivity, setRecentActivity] = useState<RecentActivity[]>([]);
+  // Read live from manifest so the popup can never lie about which build is loaded.
+  const [version, setVersion] = useState('?');
+  useEffect(() => {
+    try {
+      setVersion(chrome.runtime.getManifest().version);
+    } catch {
+      setVersion('unknown');
+    }
+  }, []);
 
   useEffect(() => {
     // Load from chrome.storage.local
@@ -223,7 +232,7 @@ export default function Popup() {
       <div style={headerStyle}>
         <div style={logoStyle}>∆</div>
         <span style={titleStyle}>SolShield</span>
-        <span style={versionStyle}>v0.1.0-alpha</span>
+        <span style={versionStyle}>v{version}</span>
       </div>
 
       {/* Toggle */}

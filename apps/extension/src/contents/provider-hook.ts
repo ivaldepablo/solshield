@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.1.3';
+const SOLSHIELD_VERSION = '0.1.4';
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -746,77 +746,129 @@ function setupWalletStandardHook(): void {
 }
 
 /* ──────────────────────────────────────────────────────────────────
- * postMessage safety net
+ * Pre-write provider trap
  *
- * Some wallet abstraction SDKs (Dynamic, Privy, Reown) cache method
- * references at app load time and call them directly later — bypassing
- * our defineProperty getters. As a final layer, we hook window.postMessage
- * and detect signing requests by shape (regardless of who's sending them).
+ * The most reliable interception point isn't AFTER a wallet writes
+ * window.solana — it's defining `window.solana` ourselves with a
+ * setter, BEFORE any wallet runs. Whoever (Phantom, Solflare,
+ * arbitrary new wallet) tries to assign `window.solana = provider`
+ * goes through our setter, we wrap on write, and the dapp later
+ * reads back the wrapped version. This is the technique used by
+ * Pocket Universe, Stelo, ScamSniffer.
  *
- * This is a "best effort" interceptor and currently logs to
- * window.__solshield.interceptions for diagnostics. Production-blocking
- * via this path is risky (wallets use a confirm/response handshake we'd
- * have to fake), so for now we use it to surface bypass cases on the
- * /diagnostic page.
+ * NOTE: v0.1.3 had a window.postMessage interceptor here that caused
+ * an infinite loop in React's scheduler (which calls postMessage for
+ * task scheduling). Removed in v0.1.4 — the property-setter trap
+ * achieves the same coverage without touching message dispatch.
  * ────────────────────────────────────────────────────────────────── */
 
-function setupPostMessageInterceptor(): void {
-  const original = window.postMessage.bind(window);
-  let installed = false;
-
+/** Build a setter that wraps any incoming provider object on assignment. */
+function trapProvider(target: object, key: string, label: string): void {
+  // If something is already there, wrap and re-store via the new descriptor.
+  let stored: unknown = (target as Record<string, unknown>)[key];
+  if (stored && typeof stored === 'object') {
+    safeSync(`provider-trap:${label}:initial`, () => {
+      patchProvider(stored as Record<string, unknown>, label);
+    }, undefined);
+  }
   try {
-    Object.defineProperty(window, 'postMessage', {
+    Object.defineProperty(target, key, {
       configurable: true,
-      writable: true,
-      value: function (this: Window, message: unknown, ...rest: unknown[]) {
-        // Wrap the inspection in a try; if anything throws (cyclic objects,
-        // proxies that throw on access, etc.) we still pass through the message.
-        if (!inSafeMode()) {
-          try {
-            if (message && typeof message === 'object') {
-              const msg = message as Record<string, unknown>;
-              const candidate =
-                (typeof msg.method === 'string' ? msg.method : undefined) ||
-                (typeof msg.type === 'string' ? msg.type : undefined) ||
-                '';
-              if (candidate && /sign(transaction|message|in|all)?/i.test(candidate)) {
-                recordInterception(
-                  /transaction/i.test(candidate)
-                    ? 'wallet-standard-tx'
-                    : 'wallet-standard-msg',
-                  'unknown',
-                );
-              }
-            }
-          } catch (err) {
-            recordError('postMessage:inspect', err);
-          }
-        }
-        // pass through always — never let our inspection drop a real message
-        try {
-          return original.call(window, message as never, ...(rest as []));
-        } catch (err) {
-          // postMessage itself shouldn't throw, but be safe
-          recordError('postMessage:passthrough', err);
+      enumerable: true,
+      get: () => stored,
+      set: (newValue: unknown) => {
+        stored = newValue;
+        if (newValue && typeof newValue === 'object') {
+          safeSync(`provider-trap:${label}:set`, () => {
+            patchProvider(newValue as Record<string, unknown>, label);
+          }, undefined);
         }
       },
     });
-    installed = true;
   } catch (err) {
-    recordError('postMessage:defineProperty', err);
+    recordError(`provider-trap:${label}:defineProperty`, err);
   }
+}
 
-  try {
-    ensureStatus().hooks.postMessageInterceptor = installed;
-  } catch {
-    // ignore counter update failure
-  }
+function setupProviderTraps(): void {
+  // window.solana — used by older Phantom builds and most wallet adapters.
+  safeSync('trap:window.solana', () => {
+    trapProvider(window, 'solana', 'window.solana');
+  }, undefined);
+
+  // window.solflare — Solflare's primary handle.
+  safeSync('trap:window.solflare', () => {
+    trapProvider(window, 'solflare', 'solflare');
+  }, undefined);
+
+  // window.phantom — Phantom uses a nested object: window.phantom.solana.
+  // We can't trap nested keys before the parent exists, so we trap window.phantom
+  // and then trap .solana once phantom is set.
+  safeSync('trap:window.phantom', () => {
+    let phantomStored: unknown = (window as unknown as Record<string, unknown>).phantom;
+    const wrapPhantom = (p: unknown) => {
+      if (!p || typeof p !== 'object') return;
+      // If phantom.solana already exists, patch it.
+      const inner = (p as Record<string, unknown>).solana;
+      if (inner && typeof inner === 'object') {
+        patchProvider(inner as Record<string, unknown>, 'phantom.solana');
+      }
+      // Trap future writes to phantom.solana.
+      try {
+        const phantomObj = p as Record<string, unknown>;
+        let solanaStored: unknown = phantomObj.solana;
+        Object.defineProperty(phantomObj, 'solana', {
+          configurable: true,
+          enumerable: true,
+          get: () => solanaStored,
+          set: (newSolana: unknown) => {
+            solanaStored = newSolana;
+            if (newSolana && typeof newSolana === 'object') {
+              safeSync('trap:phantom.solana:set', () => {
+                patchProvider(newSolana as Record<string, unknown>, 'phantom.solana');
+              }, undefined);
+            }
+          },
+        });
+      } catch (err) {
+        recordError('trap:phantom.solana:defineProperty', err);
+      }
+    };
+
+    if (phantomStored && typeof phantomStored === 'object') {
+      wrapPhantom(phantomStored);
+    }
+    Object.defineProperty(window, 'phantom', {
+      configurable: true,
+      enumerable: true,
+      get: () => phantomStored,
+      set: (newPhantom: unknown) => {
+        phantomStored = newPhantom;
+        wrapPhantom(newPhantom);
+      },
+    });
+  }, undefined);
+
+  // Mark all three legacy hooks as "ready" — actual hook flips happen inside
+  // patchProvider when wallets assign themselves through our setter.
+  ensureStatus().hooks.legacyWindowSolana = true;
+  ensureStatus().hooks.legacyPhantom = true;
+  ensureStatus().hooks.legacySolflare = true;
+  // postMessage interceptor removed — see comment block above.
+  ensureStatus().hooks.postMessageInterceptor = false;
 }
 
 // Start patching when script loads. Each top-level setup is independently
 // guarded — if one throws, the others still install and the page stays usable.
+//
+// Order matters:
+//   1. setupProviderTraps    — define window.solana / window.phantom / window.solflare
+//                              with setters BEFORE any wallet writes them.
+//   2. initProviderPatching  — best-effort poll for wallets that already wrote
+//                              their provider before we got here.
+//   3. setupWalletStandardHook — modern dapp interception via wallet-standard.
+safeSync('init:provider-traps', setupProviderTraps, undefined);
 safeSync('init:legacy-providers', initProviderPatching, undefined);
 safeSync('init:wallet-standard', setupWalletStandardHook, undefined);
-safeSync('init:postmessage', setupPostMessageInterceptor, undefined);
 
 export {};
