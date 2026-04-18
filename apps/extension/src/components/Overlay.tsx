@@ -306,6 +306,20 @@ export function Overlay({ verdict, onReject, onProceed }: OverlayProps) {
           </button>
         </div>
 
+        {/* wallet hint — after proceed the wallet's own popup opens */}
+        <p
+          style={{
+            color: colors.dim,
+            fontSize: 11,
+            marginTop: 12,
+            marginBottom: 0,
+            textAlign: 'center',
+            letterSpacing: '0.04em',
+          }}
+        >
+          → after proceed your wallet popup will open · confirm there to sign
+        </p>
+
         {/* footer */}
         <p style={footerStyle}>analyzed by claude haiku 4.5 → opus 4.7 · by 0xnullpavel</p>
       </div>

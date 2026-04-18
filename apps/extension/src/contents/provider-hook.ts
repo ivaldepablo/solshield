@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.5';
+const SOLSHIELD_VERSION = '0.4.6';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
@@ -127,6 +127,19 @@ function wrapSealedProviderObject(real: object): object {
             );
             try {
               Object.defineProperty(cached, '__solshield_wrapped', { value: true });
+            } catch { /* ignore */ }
+            // Pocket Universe `.toString` spoof — even on the cached
+            // sealed-provider method, dapps that read
+            // `window.solflare.signMessage.toString()` see native code.
+            // (createProxyFn already installs this; we re-affirm in case the
+            //  raw function had a non-standard name.)
+            try {
+              const rawName = (raw as { name?: string }).name || (prop as string);
+              Object.defineProperty(cached, 'toString', {
+                value: () => `function ${rawName}() { [native code] }`,
+                writable: true,
+                configurable: true,
+              });
             } catch { /* ignore */ }
             wrappedMethodCache.set(prop as string, cached);
           }
@@ -697,11 +710,23 @@ function createProxyFn(
     }
   };
 
-  // Preserve original function properties for dapp detection evasion
-  Object.defineProperty(wrapped, 'name', { value: original.name });
-  Object.defineProperty(wrapped, 'toString', {
-    value: () => original.toString(),
-  });
+  // Preserve original function properties for dapp detection evasion.
+  // Pocket Universe `.toString` spoof: hardcode the native-function shape so
+  // dapps that fingerprint via `fn.toString()` see what they would see if our
+  // wrapper weren't there. Delegating to `original.toString()` is risky if
+  // `original` is itself wrapped (chained extensions) or has been monkeyed
+  // with — the canonical native-code marker is what we want.
+  try {
+    Object.defineProperty(wrapped, 'name', { value: original.name, configurable: true });
+  } catch { /* ignore */ }
+  try {
+    const fnName = original.name || type;
+    Object.defineProperty(wrapped, 'toString', {
+      value: () => `function ${fnName}() { [native code] }`,
+      writable: true,
+      configurable: true,
+    });
+  } catch { /* ignore */ }
 
   return wrapped;
 }
@@ -934,33 +959,100 @@ function patchProvider(
 
 /**
  * Poll for wallet providers and patch them as they appear.
+ *
+ * Covers known wallet namespaces directly so dapps that bypass wallet-standard
+ * and call the legacy provider object directly are still intercepted. Each
+ * namespace is checked defensively — missing wallets are silently skipped.
  */
 function initProviderPatching(): void {
   const maxAttempts = 50; // ~5 seconds at 100ms intervals
   let attempts = 0;
 
+  /** Helper: safely read a sub-object from an unknown record. */
+  const subObj = (
+    parent: unknown,
+    key: string,
+  ): Record<string, unknown> | null => {
+    if (!parent || typeof parent !== 'object') return null;
+    const v = (parent as Record<string, unknown>)[key];
+    if (!v || typeof v !== 'object') return null;
+    return v as Record<string, unknown>;
+  };
+
   const checkProviders = (): void => {
     const w = window as unknown as Record<string, unknown>;
 
+    // ── Phantom (and most generic providers) ─────────────────────────
     if (w.solana && typeof w.solana === 'object') {
       patchProvider(w, 'solana', 'window.solana');
     }
-
-    if (
-      w.phantom &&
-      typeof w.phantom === 'object' &&
-      (w.phantom as Record<string, unknown>).solana &&
-      typeof (w.phantom as Record<string, unknown>).solana === 'object'
-    ) {
-      patchProvider(
-        w.phantom as Record<string, unknown>,
-        'solana',
-        'phantom.solana',
-      );
+    if (subObj(w, 'phantom')) {
+      const phantom = w.phantom as Record<string, unknown>;
+      if (subObj(phantom, 'solana')) {
+        patchProvider(phantom, 'solana', 'phantom.solana');
+      }
     }
 
+    // ── Solflare ──────────────────────────────────────────────────────
     if (w.solflare && typeof w.solflare === 'object') {
       patchProvider(w, 'solflare', 'solflare');
+    }
+
+    // ── Trust Wallet (exposes both casings) ──────────────────────────
+    if (subObj(w, 'trustwallet')) {
+      const tw = w.trustwallet as Record<string, unknown>;
+      if (subObj(tw, 'solana')) {
+        patchProvider(tw, 'solana', 'trustwallet.solana');
+      }
+    }
+    if (subObj(w, 'trustWallet')) {
+      const tw = w.trustWallet as Record<string, unknown>;
+      if (subObj(tw, 'solana')) {
+        patchProvider(tw, 'solana', 'trustWallet.solana');
+      }
+    }
+
+    // ── Coinbase Wallet (extension namespace, polled even pre-onboarding) ──
+    if (w.coinbaseWalletExtension && typeof w.coinbaseWalletExtension === 'object') {
+      patchProvider(w, 'coinbaseWalletExtension', 'coinbaseWalletExtension');
+    }
+
+    // ── Glow ──────────────────────────────────────────────────────────
+    if (w.glow && typeof w.glow === 'object') {
+      patchProvider(w, 'glow', 'glow');
+    }
+    if (w.glowSolana && typeof w.glowSolana === 'object') {
+      patchProvider(w, 'glowSolana', 'glowSolana');
+    }
+
+    // ── MathWallet (both casings) ─────────────────────────────────────
+    if (subObj(w, 'mathWallet')) {
+      const mw = w.mathWallet as Record<string, unknown>;
+      if (subObj(mw, 'solana')) {
+        patchProvider(mw, 'solana', 'mathWallet.solana');
+      }
+    }
+    if (subObj(w, 'mathwallet')) {
+      const mw = w.mathwallet as Record<string, unknown>;
+      if (subObj(mw, 'solana')) {
+        patchProvider(mw, 'solana', 'mathwallet.solana');
+      }
+    }
+
+    // ── Coin98 (note: sub-key is 'sol', NOT 'solana') ────────────────
+    if (subObj(w, 'coin98')) {
+      const c98 = w.coin98 as Record<string, unknown>;
+      if (subObj(c98, 'sol')) {
+        patchProvider(c98, 'sol', 'coin98.sol');
+      }
+    }
+
+    // ── Backpack ──────────────────────────────────────────────────────
+    if (subObj(w, 'backpack')) {
+      const bp = w.backpack as Record<string, unknown>;
+      if (subObj(bp, 'solana')) {
+        patchProvider(bp, 'solana', 'backpack.solana');
+      }
     }
 
     attempts++;
@@ -1092,8 +1184,18 @@ function wrapWalletStandardMethod(
   };
 
   Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
-  Object.defineProperty(wrapped, 'name', { value: orig.name });
-  Object.defineProperty(wrapped, 'toString', { value: () => orig.toString() });
+  try {
+    Object.defineProperty(wrapped, 'name', { value: orig.name, configurable: true });
+  } catch { /* ignore */ }
+  // Pocket Universe spoof: native-code shape so dapps cannot detect via .toString().
+  try {
+    const fnName = orig.name || methodName;
+    Object.defineProperty(wrapped, 'toString', {
+      value: () => `function ${fnName}() { [native code] }`,
+      writable: true,
+      configurable: true,
+    });
+  } catch { /* ignore */ }
   f[methodName] = wrapped;
 }
 
