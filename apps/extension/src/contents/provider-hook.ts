@@ -22,8 +22,38 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.0';
+const SOLSHIELD_VERSION = '0.4.1';
 const VERDICT_TIMEOUT_MS = 15_000;
+
+// CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
+// can run, so a malicious dapp can't hijack window.fetch or related globals
+// to feed us fake "safe" verdicts. Captured by reference at document_start
+// before any inline script in the page parses.
+const NATIVE = {
+  fetch: window.fetch.bind(window),
+  AbortController: window.AbortController,
+  setTimeout: window.setTimeout.bind(window),
+  clearTimeout: window.clearTimeout.bind(window),
+  setInterval: window.setInterval.bind(window),
+  clearInterval: window.clearInterval.bind(window),
+  jsonStringify: JSON.stringify.bind(JSON),
+  jsonParse: JSON.parse.bind(JSON),
+  postMessage: window.postMessage.bind(window),
+  addEventListener: window.addEventListener.bind(window),
+  removeEventListener: window.removeEventListener.bind(window),
+  dispatchEvent: window.dispatchEvent.bind(window),
+} as const;
+
+// Closure-private safeMode boolean. The `__solshield.safeMode` getter mirrors
+// it for /diagnostic, but the setter is a no-op so a malicious dapp cannot
+// flip safeMode to disable us.
+let _safeMode = false;
+let _safeModeReason: string | null = null;
+
+// Symbol-keyed marker so a malicious dapp can't enumerate or spoof it.
+// (Earlier we used a string property which dapp could set on its own
+// callbacks to short-circuit our wrapping logic.)
+const WRAPPING_DETAIL = Symbol('solshield.wrappingDetail');
 
 /**
  * v0.1.3 — bulletproof error handling.
@@ -71,7 +101,7 @@ interface SolShieldStatus {
 function ensureStatus(): SolShieldStatus {
   const w = window as unknown as { __solshield?: SolShieldStatus };
   if (!w.__solshield) {
-    w.__solshield = {
+    const status: SolShieldStatus = {
       version: SOLSHIELD_VERSION,
       installedAt: Date.now(),
       safeMode: false,
@@ -88,6 +118,24 @@ function ensureStatus(): SolShieldStatus {
       errors: [],
       log: [],
     };
+    // Closure-bind safeMode getters so a malicious dapp cannot flip them.
+    Object.defineProperty(status, 'safeMode', {
+      enumerable: true,
+      configurable: false,
+      get: () => _safeMode,
+      set: () => {
+        /* read-only — protect against dapp tampering */
+      },
+    });
+    Object.defineProperty(status, 'safeModeReason', {
+      enumerable: true,
+      configurable: false,
+      get: () => _safeModeReason,
+      set: () => {
+        /* read-only */
+      },
+    });
+    w.__solshield = status;
   }
   return w.__solshield;
 }
@@ -118,12 +166,12 @@ function recordError(phase: string, err: unknown): void {
     if (status.errors.length > 20) status.errors.shift();
     logEvent('err', phase, message);
 
-    if (!status.safeMode) {
+    if (!_safeMode) {
       const recent = status.errors.filter((e) => Date.now() - e.at < SAFE_MODE_WINDOW_MS);
       if (recent.length >= SAFE_MODE_THRESHOLD) {
-        status.safeMode = true;
-        status.safeModeReason = `${recent.length} errors in ${SAFE_MODE_WINDOW_MS / 1000}s — extension self-disabled to protect this page`;
-        console.warn('[SolShield]', status.safeModeReason);
+        _safeMode = true;
+        _safeModeReason = `${recent.length} errors in ${SAFE_MODE_WINDOW_MS / 1000}s — extension self-disabled to protect this page`;
+        console.warn('[SolShield]', _safeModeReason);
       }
     }
   } catch {
@@ -132,11 +180,7 @@ function recordError(phase: string, err: unknown): void {
 }
 
 function inSafeMode(): boolean {
-  try {
-    return ensureStatus().safeMode;
-  } catch {
-    return false;
-  }
+  return _safeMode;
 }
 
 /**
@@ -793,7 +837,9 @@ function wrapWalletStandardWallet(wallet: WalletStandardWallet | unknown): void 
  */
 function setupWalletStandardHook(): void {
   // Marker for "this detail is OUR wrapping callback" so we don't infinite-loop.
-  const WRAPPING_MARKER = '__solshield_wrapping_detail';
+  // Using a Symbol (closure-private) prevents a malicious dapp from spoofing
+  // the marker on its own callbacks to bypass our wrapping.
+  const WRAPPING_MARKER = WRAPPING_DETAIL;
 
   // Our API. Wallets call `register(wallet)` on this when they discover us.
   // Each wallet entry is independently guarded — one bad wallet can't poison the rest.
@@ -823,13 +869,13 @@ function setupWalletStandardHook(): void {
         if (inSafeMode()) return;
         try {
           const detail = (event as CustomEvent).detail as
-            | (((api: WalletStandardApi) => void) & { [k: string]: boolean | undefined })
+            | ((api: WalletStandardApi) => void)
             | undefined;
           if (typeof detail !== 'function') return;
 
           // Already-wrapped detail (we redispatched this) → let the dapp's
           // listener handle it normally.
-          if (detail[WRAPPING_MARKER]) return;
+          if ((detail as unknown as Record<symbol, unknown>)[WRAPPING_MARKER]) return;
 
           // STOP propagation so the dapp's listener never sees this raw event.
           // We'll redispatch with a wrapping detail.
@@ -862,7 +908,7 @@ function setupWalletStandardHook(): void {
               recordError('wallet-standard:wrapped-detail-call', err);
             }
           };
-          (wrappingDetail as unknown as Record<string, boolean>)[WRAPPING_MARKER] = true;
+          (wrappingDetail as unknown as Record<symbol, boolean>)[WRAPPING_MARKER] = true;
 
           // Redispatch the wrapped event so the dapp's listener picks it up.
           // Our own listener will see the marker and pass through.
@@ -894,9 +940,16 @@ function setupWalletStandardHook(): void {
   }
 
   // Belt-and-braces: some apps construct their own getWallets() and only expose
-  // it via navigator.wallets. Poll and wrap anything we missed.
-  setInterval(() => {
-    if (inSafeMode()) return;
+  // it via navigator.wallets. Poll for 30s then stop (was running forever, leaking
+  // ~86k timer fires per page-day per agent's perf audit).
+  let pollAttempts = 0;
+  const POLL_MAX = 60; // 60 × 500ms = 30s
+  const pollId = NATIVE.setInterval(() => {
+    pollAttempts++;
+    if (pollAttempts > POLL_MAX || inSafeMode()) {
+      NATIVE.clearInterval(pollId);
+      return;
+    }
     safeSync(
       'wallet-standard:poll',
       () => {
@@ -1007,10 +1060,10 @@ function setupNavigatorWalletsHook(): void {
   // (after the wallet-standard library inits).
   tryInstall();
   let attempts = 0;
-  const id = setInterval(() => {
+  const id = NATIVE.setInterval(() => {
     attempts++;
     tryInstall();
-    if (installed || attempts >= 50) clearInterval(id);
+    if (installed || attempts >= 50) NATIVE.clearInterval(id);
   }, 100);
 }
 
@@ -1170,20 +1223,26 @@ async function getVerdict(
   const url = `https://solshield.dev/api/${endpoint}`;
   logEvent('info', 'verdict-fetch', `→ ${endpoint}`);
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    const res = await fetch(url, {
+    // Use stashed native APIs — protects against dapps that hijack window.fetch
+    // or AbortController to feed us forged "safe" verdicts.
+    const ctrl = new NATIVE.AbortController();
+    const timer = NATIVE.setTimeout(() => ctrl.abort(), 8000);
+    const res = await NATIVE.fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: NATIVE.jsonStringify(body),
       signal: ctrl.signal,
     });
-    clearTimeout(timer);
+    NATIVE.clearTimeout(timer);
     if (!res.ok) {
       logEvent('warn', 'verdict-fetch', `HTTP ${res.status}`);
       return null;
     }
-    const data = (await res.json()) as { verdict: 'safe' | 'suspicious' | 'danger'; summary?: string };
+    const text = await res.text();
+    const data = NATIVE.jsonParse(text) as {
+      verdict: 'safe' | 'suspicious' | 'danger';
+      summary?: string;
+    };
     logEvent('info', 'verdict-fetch', `← ${data.verdict}`);
     return data;
   } catch (err) {
