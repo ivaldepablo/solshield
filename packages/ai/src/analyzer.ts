@@ -31,7 +31,11 @@ export class Analyzer {
   private readonly deepModel: string;
 
   constructor(opts: AnalyzerOptions) {
-    this.client = new Anthropic({ apiKey: opts.apiKey, timeout: ANTHROPIC_TIMEOUT_MS });
+    this.client = new Anthropic({
+      apiKey: opts.apiKey,
+      timeout: ANTHROPIC_TIMEOUT_MS,
+      maxRetries: 0,
+    });
     this.triageModel = opts.triageModel ?? MODEL_IDS.triage;
     this.deepModel = opts.deepModel ?? MODEL_IDS.deep;
   }

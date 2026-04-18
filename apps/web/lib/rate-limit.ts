@@ -77,7 +77,8 @@ export async function checkRateLimit(
 
   const key = `ratelimit:inspect:${identifier}:${bucket}`;
   try {
-    const count = await raceWithTimeout(client.incr(key), 1000);
+    const incrPromise = client.incr(key);
+    const count = await raceWithTimeout(incrPromise, 1000);
     if (count === 1) {
       void raceWithTimeout(client.expire(key, windowSeconds), 1000).catch(() => {
         // best-effort — if expire times out the bucket key just lingers a bit
@@ -91,6 +92,16 @@ export async function checkRateLimit(
       limit: max,
     };
   } catch (err) {
+    // If we lost the race to the timer but the underlying incr eventually
+    // resolves with 1, set the TTL defensively so we don't orphan a
+    // never-expiring bucket key.
+    void (async () => {
+      try {
+        await client.expire(key, windowSeconds);
+      } catch {
+        /* ignore */
+      }
+    })();
     if (!g.__solshieldRedisWarned) {
       console.warn(`[rate-limit] redis call failed: ${(err as Error).message} — failing open`);
       g.__solshieldRedisWarned = true;

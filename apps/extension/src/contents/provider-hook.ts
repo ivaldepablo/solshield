@@ -22,13 +22,23 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.2';
+const SOLSHIELD_VERSION = '0.4.3';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
 // can run, so a malicious dapp can't hijack window.fetch or related globals
 // to feed us fake "safe" verdicts. Captured by reference at document_start
 // before any inline script in the page parses.
+//
+// We also stash EventTarget.prototype.{addEventListener,removeEventListener,
+// dispatchEvent} so that even if a dapp later does
+// `document.addEventListener = (...) => {}`, we can still call the real one
+// via `_proto_addEventListener.call(document, ...)`.
+const _proto_addEventListener = EventTarget.prototype.addEventListener;
+const _proto_removeEventListener = EventTarget.prototype.removeEventListener;
+const _proto_dispatchEvent = EventTarget.prototype.dispatchEvent;
+const _CustomEvent = window.CustomEvent;
+
 const NATIVE = {
   fetch: window.fetch.bind(window),
   AbortController: window.AbortController,
@@ -42,6 +52,14 @@ const NATIVE = {
   addEventListener: window.addEventListener.bind(window),
   removeEventListener: window.removeEventListener.bind(window),
   dispatchEvent: window.dispatchEvent.bind(window),
+  documentAddEventListener: (
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | AddEventListenerOptions,
+  ): void => _proto_addEventListener.call(document, type, listener, options),
+  documentDispatchEvent: (event: Event): boolean =>
+    _proto_dispatchEvent.call(document, event),
+  CustomEvent: _CustomEvent,
 } as const;
 
 // Closure-private safeMode boolean. The `__solshield.safeMode` getter mirrors
@@ -878,8 +896,25 @@ function setupWalletStandardHook(): void {
           if ((detail as unknown as Record<symbol, unknown>)[WRAPPING_MARKER]) return;
 
           // STOP propagation so the dapp's listener never sees this raw event.
-          // We'll redispatch with a wrapping detail.
-          event.stopImmediatePropagation();
+          // We'll redispatch with a wrapping detail. If real Phantom or
+          // another extension ran first and replaced
+          // event.stopImmediatePropagation with a throwing shim (defensive
+          // pattern some wallets use to prevent third parties from blocking
+          // their registration), the call will throw — log as INFO and
+          // continue. The redispatched wrapping event below is what makes
+          // the dapp pick up our wrapped wallets; the duplicate raw event
+          // reaching the dapp is at worst harmless (some dapps de-dup, some
+          // get both wrapped+unwrapped registered, which is still safe
+          // because our wrapped Proxy intercepts on read).
+          try {
+            event.stopImmediatePropagation();
+          } catch (err) {
+            logEvent(
+              'info',
+              'register-wallet',
+              `stopImmediatePropagation blocked by another script: ${err instanceof Error ? err.message : String(err)} — continuing with wrap`,
+            );
+          }
 
           logEvent('info', 'register-wallet', 'caught raw event, wrapping detail and redispatching');
 
@@ -1251,10 +1286,49 @@ async function getVerdict(
   }
 }
 
-/** Show overlay via overlay-mount in ISOLATED world. v0.4.2: decision arrives
- *  on a transferred MessagePort, not a public postMessage — a malicious dapp
- *  cannot forge `{decision: 'proceed'}` because it has no reference to port1.
- *  Defaults to reject on timeout (safer for non-safe verdicts). */
+/** Map of pending overlay decisions, keyed by per-request crypto-random
+ *  requestId. The dapp cannot read requestId from the show event because
+ *  ISOLATED's capture-phase listener calls stopImmediatePropagation before
+ *  any MAIN-world dapp listener can fire. */
+const _pendingOverlayDecisions = new Map<string, (d: 'proceed' | 'reject', why: string) => void>();
+
+/** Decision listener registered at MODULE LOAD (document_start in MAIN). The
+ *  dapp's first <script> tag runs after document_start, so our listener is
+ *  always first in registration order on document. We use capture phase +
+ *  stopImmediatePropagation so dapp listeners NEVER see the decision event.
+ *
+ *  Threat model: dapp could dispatch its own fake `solshield-decision` events
+ *  with guessed requestIds. We defend by (a) requestId being crypto-random
+ *  (newId from messaging), and (b) the show event's payload being hidden
+ *  from the dapp (overlay-mount stops it in ISOLATED capture phase). */
+_proto_addEventListener.call(
+  document,
+  'solshield-decision',
+  (ev: Event): void => {
+    try {
+      ev.stopImmediatePropagation();
+      const evt = ev as CustomEvent<{ requestId?: string; decision?: 'proceed' | 'reject' }>;
+      const detail = evt.detail ?? {};
+      const requestId = detail.requestId;
+      const decision = detail.decision === 'proceed' ? 'proceed' : 'reject';
+      if (typeof requestId !== 'string') return;
+      const resolver = _pendingOverlayDecisions.get(requestId);
+      if (!resolver) return; // unknown requestId → ignore (dapp spoof attempt)
+      resolver(decision, 'event');
+    } catch (err) {
+      logEvent('err', 'overlay-decision', err instanceof Error ? err.message : String(err));
+    }
+  },
+  { capture: true },
+);
+
+/** Show overlay via overlay-mount in ISOLATED world. v0.4.3: decision arrives
+ *  via a CustomEvent on `document`. provider-hook's capture-phase listener
+ *  (registered at module load = document_start) fires BEFORE any dapp
+ *  listener and calls stopImmediatePropagation, so the dapp cannot observe
+ *  or forge decisions for known requestIds. requestId itself is hidden from
+ *  the dapp because overlay-mount also stops the show event in capture
+ *  phase. Defaults to reject on timeout (safer for non-safe verdicts). */
 async function askUserViaOverlay(
   verdictData: { verdict: 'safe' | 'suspicious' | 'danger'; summary?: string },
   kind: 'msg' | 'tx',
@@ -1262,38 +1336,29 @@ async function askUserViaOverlay(
   const requestId = newId();
   logEvent('info', 'overlay-ask', `${requestId.slice(-6)}`);
   return new Promise((resolve) => {
-    const channel = new MessageChannel();
     let settled = false;
     const settle = (decision: 'proceed' | 'reject', why: string): void => {
       if (settled) return;
       settled = true;
       NATIVE.clearTimeout(timer);
-      try { channel.port1.onmessage = null; } catch { /* ignore */ }
-      try { channel.port1.close(); } catch { /* ignore */ }
+      _pendingOverlayDecisions.delete(requestId);
       logEvent('info', 'overlay-ask', `${requestId.slice(-6)} → ${decision} (${why})`);
       resolve(decision);
     };
 
-    const timer = NATIVE.setTimeout(() => {
-      settle('reject', 'timeout');
-    }, 60_000);
+    const timer = NATIVE.setTimeout(() => settle('reject', 'timeout'), 60_000);
+    _pendingOverlayDecisions.set(requestId, settle);
 
-    channel.port1.onmessage = (e: MessageEvent): void => {
-      const d = (e.data ?? {}) as { decision?: 'proceed' | 'reject' };
-      settle(d.decision === 'proceed' ? 'proceed' : 'reject', 'port-msg');
-    };
-    try { channel.port1.start(); } catch { /* ignore */ }
-
-    NATIVE.postMessage(
-      {
-        __solshield_show_overlay: true,
-        id: requestId,
-        verdict: verdictData,
-        kind,
-      },
-      '*',
-      [channel.port2],
-    );
+    try {
+      NATIVE.documentDispatchEvent(
+        new NATIVE.CustomEvent('solshield-show', {
+          detail: { requestId, verdict: verdictData, kind },
+        }),
+      );
+    } catch (err) {
+      logEvent('err', 'overlay-ask', `dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
+      settle('reject', 'dispatch-fail');
+    }
   });
 }
 

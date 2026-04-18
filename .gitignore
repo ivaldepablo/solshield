@@ -28,3 +28,8 @@ Thumbs.db
 *.log
 npm-debug.log*
 pnpm-debug.log*
+
+# test artifacts (3rd-party CRX bundles, screenshots, generated wallets)
+apps/extension/test/real-wallets/
+apps/extension/test/screenshots/
+apps/extension/test/wallet.json

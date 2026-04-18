@@ -6,6 +6,11 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 
+// Snapshot Element.prototype.attachShadow at module load. If a dapp later
+// monkey-patches `Element.prototype.attachShadow` to leak the closed shadow
+// root, we still call the original via the saved reference.
+const _proto_attachShadow = Element.prototype.attachShadow;
+
 export function mountInShadow(
   host: HTMLElement,
   element: React.ReactElement
@@ -13,7 +18,7 @@ export function mountInShadow(
   // closed mode: dapp page scripts cannot read host.shadowRoot to inspect or
   // tamper with overlay DOM. Lost inspector access is acceptable — we ship
   // /diagnostic for our own debugging.
-  const shadow = host.attachShadow({ mode: 'closed' });
+  const shadow = _proto_attachShadow.call(host, { mode: 'closed' });
 
   const container = document.createElement('div');
   container.id = 'solshield-root';

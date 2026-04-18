@@ -1,5 +1,5 @@
 /**
- * ISOLATED-world content script (document_idle).
+ * ISOLATED-world content script (document_start, post-v0.4.3).
  *
  * Bridges the page's MAIN-world provider hook with the extension's background
  * service worker, and mounts the React Overlay into a Shadow DOM when a
@@ -19,16 +19,39 @@ import { mountInShadow } from '../lib/shadow-dom';
 import { inspectTx, inspectMessage } from '../lib/api-client';
 import type { ContentResponse, InpageRequest, VerdictView } from '../lib/messaging';
 
+// document_start so our capture-phase 'solshield-show' listener is registered
+// BEFORE any dapp <script> runs. Otherwise the dapp could register its own
+// listener first and either spoof decisions or observe verdict payloads.
 export const config: PlasmoCSConfig = {
   matches: ['<all_urls>'],
   world: 'ISOLATED',
-  run_at: 'document_idle',
+  run_at: 'document_start',
 };
 
-// Random per-load host ID so a malicious dapp can't `document.querySelector`
-// for a known selector and pre-emptively .remove() our overlay.
-const HOST_ID = `solshield-overlay-${Math.random().toString(36).slice(2, 10)}`;
+// Stash native APIs at module load. If the dapp later replaces
+// `document.addEventListener` etc., we still call originals via the prototype.
+const _proto_addEventListener = EventTarget.prototype.addEventListener;
+const _proto_dispatchEvent = EventTarget.prototype.dispatchEvent;
+const _CustomEvent = window.CustomEvent;
+const _setTimeout = window.setTimeout.bind(window);
+const _clearTimeout = window.clearTimeout.bind(window);
+const _crypto = window.crypto;
+
+function randomHostId(): string {
+  try {
+    const buf = new Uint8Array(8);
+    _crypto.getRandomValues(buf);
+    let s = '';
+    for (let i = 0; i < buf.length; i++) s += (buf[i] ?? 0).toString(16).padStart(2, '0');
+    return `solshield-overlay-${s}`;
+  } catch {
+    return `solshield-overlay-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+const HOST_ID = randomHostId();
 const OVERLAY_TIMEOUT_MS = 60_000;
+const MAX_REATTACH_ATTEMPTS = 5;
 
 function postContentResponse(message: ContentResponse): void {
   // postMessage to self — the page's MAIN world will see it via its own
@@ -83,7 +106,7 @@ function waitForUserDecision(
         reject(new Error('overlay decision timeout'));
         return;
       }
-      setTimeout(tick, 80);
+      _setTimeout(tick, 80);
     };
     tick();
   });
@@ -113,13 +136,20 @@ async function showOverlayAndAwaitDecision(
     }),
   );
 
-  // If the dapp tries to remove our host element, re-attach it. We can't
-  // protect the host element itself with Object.freeze — attempting that on
-  // an Element is silently ignored — but we can detect removal and undo it.
+  // If the dapp tries to remove our host element, re-attach it (capped at
+  // MAX_REATTACH_ATTEMPTS to avoid an infinite re-attach loop if the dapp
+  // synchronously re-removes on every mutation).
+  let reattachAttempts = 0;
   const observer = new MutationObserver(() => {
     if (signal.decision) return;
     if (!document.body.contains(host)) {
-      postLogEntry('warn', 'overlay', 'host removed by page — re-attaching');
+      reattachAttempts++;
+      if (reattachAttempts > MAX_REATTACH_ATTEMPTS) {
+        postLogEntry('warn', 'overlay', 'host removed too many times — surrendering to reject');
+        signal.decision = 'reject';
+        return;
+      }
+      postLogEntry('warn', 'overlay', `host removed by page — re-attaching (#${reattachAttempts})`);
       try { unmount(); } catch { /* ignore */ }
       document.body.appendChild(host);
       unmount = mountInShadow(
@@ -220,93 +250,93 @@ async function handleInpageRequest(req: InpageRequest): Promise<void> {
   }
 }
 
-// Capture-phase so we run before any dapp-registered bubble listener and
-// claim the transferred MessagePort first.
-window.addEventListener(
-  'message',
-  (event) => {
-    if (event.source !== window) return;
-    const data = event.data as
-      | (InpageRequest & { __solshield_show_overlay?: undefined })
-      | {
-          __solshield_show_overlay: true;
-          id?: string;
-          verdict: VerdictView;
-          kind: VerdictView['kind'];
-        }
-      | undefined;
-    if (!data || typeof data !== 'object') return;
+// v0.4.3: decision protocol uses CustomEvent on `document` instead of
+// window.postMessage. We register at document_start in capture phase so that:
+//   1. We fire BEFORE any dapp listener (registration order; dapp scripts
+//      can't run until after document_start content scripts).
+//   2. stopImmediatePropagation prevents the dapp from EVER seeing the
+//      verdict payload or the requestId. The dapp therefore cannot forge a
+//      `solshield-decision` event because it has no valid requestId to bind.
+_proto_addEventListener.call(
+  document,
+  'solshield-show',
+  (ev: Event) => {
+    try {
+      ev.stopImmediatePropagation();
+    } catch { /* ignore */ }
+    const evt = ev as CustomEvent<{
+      requestId?: string;
+      verdict?: VerdictView;
+      kind?: VerdictView['kind'];
+    }>;
+    const detail = evt.detail ?? {};
+    const requestId = detail.requestId;
+    const verdict = detail.verdict;
+    if (typeof requestId !== 'string' || !verdict) return;
 
-    if ((data as { __solshield_show_overlay?: boolean }).__solshield_show_overlay === true) {
-      const showReq = data as {
-        __solshield_show_overlay: true;
-        id?: string;
-        verdict: VerdictView;
-        kind: VerdictView['kind'];
-      };
+    postLogEntry('info', 'recv-show', `${requestId.slice(-6)} verdict=${verdict.verdict}`);
 
-      // v0.4.2: prefer transferred MessagePort. Provider-hook in MAIN keeps
-      // port1; we own port2. Decision goes through the port — a malicious
-      // dapp listener cannot forge a reply on port1 because it has no
-      // reference to it. (Residual risk: dapp could register a capture-phase
-      // listener at document_start AND grab event.ports[0] AND postMessage on
-      // it before we do — we beat that by being the capture-phase listener
-      // on ISOLATED world, registered at document_idle when no other dapp
-      // code has yet had a chance to run inside our world.)
-      const port = event.ports?.[0];
-
-      if (port) {
-        try { port.start(); } catch { /* ignore */ }
-        const visibilityWait = document.visibilityState === 'visible'
-          ? Promise.resolve()
-          : new Promise<void>((res) => {
-              const onVis = (): void => {
-                if (document.visibilityState === 'visible') {
-                  document.removeEventListener('visibilitychange', onVis);
-                  res();
-                }
-              };
-              document.addEventListener('visibilitychange', onVis);
-              // Cap the wait — if user never returns, the per-request timer
-              // in provider-hook will expire and we'll resolve to 'reject'.
-              setTimeout(() => {
+    void (async () => {
+      try {
+        // If the tab is hidden, defer the overlay until visible — otherwise
+        // the user can't see/click it and we'd just time out at 60s.
+        if (document.visibilityState !== 'visible') {
+          await new Promise<void>((res) => {
+            const onVis = (): void => {
+              if (document.visibilityState === 'visible') {
                 document.removeEventListener('visibilitychange', onVis);
                 res();
-              }, OVERLAY_TIMEOUT_MS - 1000);
-            });
-
-        void visibilityWait.then(async () => {
-          try {
-            const decision = await showOverlayAndAwaitDecision(showReq.verdict);
-            try { port.postMessage({ decision }); } catch { /* ignore */ }
-          } catch {
-            try { port.postMessage({ decision: 'reject' as const }); } catch { /* ignore */ }
-          } finally {
-            try { port.close(); } catch { /* ignore */ }
-          }
-        });
-        return;
-      }
-
-      // Legacy postMessage path (provider-hook < 0.4.2): correlate by id.
-      void (async () => {
-        try {
-          const decision = await showOverlayAndAwaitDecision(showReq.verdict);
-          window.postMessage({ id: showReq.id, decision }, '*');
-        } catch {
-          window.postMessage({ id: showReq.id, decision: 'reject' as const }, '*');
+              }
+            };
+            document.addEventListener('visibilitychange', onVis);
+            _setTimeout(() => {
+              document.removeEventListener('visibilitychange', onVis);
+              res();
+            }, OVERLAY_TIMEOUT_MS - 1000);
+          });
         }
-      })();
-      return;
-    }
+        const decision = await showOverlayAndAwaitDecision(verdict);
+        dispatchDecision(requestId, decision);
+      } catch (err) {
+        postLogEntry('warn', 'overlay', `error: ${err instanceof Error ? err.message : String(err)}`);
+        dispatchDecision(requestId, 'reject');
+      }
+    })();
+  },
+  { capture: true },
+);
 
+function dispatchDecision(requestId: string, decision: 'proceed' | 'reject'): void {
+  try {
+    _proto_dispatchEvent.call(
+      document,
+      new _CustomEvent('solshield-decision', { detail: { requestId, decision } }),
+    );
+    postLogEntry('info', 'send-dec', `${requestId.slice(-6)} → ${decision}`);
+  } catch (err) {
+    postLogEntry('err', 'send-dec', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// Legacy window.postMessage path for older callers (analyze-message /
+// analyze-tx going through ISOLATED to fetch verdict). Provider-hook v0.4.x
+// fetches verdicts directly from MAIN and never uses this path, but we keep
+// it for any third-party integration that still might.
+_proto_addEventListener.call(
+  window,
+  'message',
+  ((event: MessageEvent) => {
+    if (event.source !== window) return;
+    const data = event.data as InpageRequest | undefined;
     if (
+      !data ||
+      typeof data !== 'object' ||
       !('type' in data) ||
       (data.type !== 'analyze-tx' && data.type !== 'analyze-message')
     ) {
       return;
     }
-    void handleInpageRequest(data as InpageRequest);
-  },
+    void handleInpageRequest(data);
+  }) as EventListener,
   { capture: true },
 );
