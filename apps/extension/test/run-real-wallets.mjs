@@ -30,7 +30,7 @@ const REAL_PHANTOM = resolve(__dirname, 'real-wallets', 'phantom');
 const REAL_SOLFLARE = resolve(__dirname, 'real-wallets', 'solflare');
 const REAL_BACKPACK = resolve(__dirname, 'real-wallets', 'backpack');
 const SCREENSHOT_DIR = resolve(__dirname, 'screenshots');
-const EXPECTED_VERSION = '0.4.3';
+const EXPECTED_VERSION = '0.4.4';
 
 const log = (...m) => process.stdout.write('[real] ' + m.join(' ') + '\n');
 
@@ -158,18 +158,33 @@ payload that should trigger a non-safe verdict from production.</p>
       // permit-style-approval rule (severity high → suspicious).
       const text = "I authorize the transfer of 100000 USDC from my wallet to merchant_address as an off-chain approval / permit.";
       const encoded = new TextEncoder().encode(text);
-      const wallets = window.__wallets__ || [];
-      const target = wallets.find(w => w.features && w.features['solana:signMessage']);
-      if (!target) {
-        out.textContent = 'NO WALLET AVAILABLE — wallets registered=' + wallets.length;
-        window.__signResult = { ok: false, msg: 'no wallet' };
-        return;
-      }
+      // Pick the path: wallet-standard (default) or legacy provider.
+      const useLegacy = new URLSearchParams(location.search).get('legacy') === '1';
+      let r;
       startSpoofing();
-      const r = await target.features['solana:signMessage'].signMessage({
-        account: { publicKey: new Uint8Array(32) },
-        message: encoded,
-      });
+      if (useLegacy && window.solflare && typeof window.solflare.signMessage === 'function') {
+        // LEGACY direct provider call — this is the path real Solflare 2.24+
+        // seals with writable:false, configurable:false. Verifies our early
+        // defineProperty interceptor wraps it.
+        window.__path = 'legacy-solflare';
+        r = await window.solflare.signMessage(encoded);
+      } else if (useLegacy && window.phantom?.solana?.signMessage) {
+        window.__path = 'legacy-phantom';
+        r = await window.phantom.solana.signMessage(encoded);
+      } else {
+        const wallets = window.__wallets__ || [];
+        const target = wallets.find(w => w.features && w.features['solana:signMessage']);
+        if (!target) {
+          out.textContent = 'NO WALLET AVAILABLE — wallets registered=' + wallets.length;
+          window.__signResult = { ok: false, msg: 'no wallet' };
+          return;
+        }
+        window.__path = 'wallet-standard';
+        r = await target.features['solana:signMessage'].signMessage({
+          account: { publicKey: new Uint8Array(32) },
+          message: encoded,
+        });
+      }
       out.textContent = 'SIGNED: ' + JSON.stringify(r).slice(0, 100);
       window.__signResult = { ok: true };
     } catch (err) {

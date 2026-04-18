@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.3';
+const SOLSHIELD_VERSION = '0.4.4';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
@@ -67,6 +67,197 @@ const NATIVE = {
 // flip safeMode to disable us.
 let _safeMode = false;
 let _safeModeReason: string | null = null;
+
+/* ──────────────────────────────────────────────────────────────────
+ * EARLY GUARD — runs before any other init.
+ *
+ * Real Solflare 2.24+ and Phantom inpage seal their provider by calling
+ * `Object.defineProperty(window, "solflare", { value: Object.freeze(obj),
+ * configurable: false, writable: false })`. Once that runs we can NEVER
+ * replace window.solflare or its methods — defineProperty throws and direct
+ * assignment silently no-ops.
+ *
+ * To wrap them we intercept `Object.defineProperty` itself at module load,
+ * BEFORE any wallet content script can call it. When we see a defineProperty
+ * targeting `window.solana`, `window.solflare`, or `window.phantom`, we
+ * substitute the descriptor's value with a Proxy that intercepts reads of
+ * sign* methods.
+ *
+ * Caveat: Chrome runs MAIN-world content scripts in extension load order, so
+ * if Solflare loads before SolShield this hook arrives too late. In that
+ * case we log it and rely on the wallet-standard wrap (which most modern
+ * dapps go through).
+ * ────────────────────────────────────────────────────────────────── */
+const _originalDefineProperty = Object.defineProperty;
+const _earlyWrappedTargets = new WeakSet<object>();
+
+function wrapSealedProviderObject(real: object): object {
+  if (_earlyWrappedTargets.has(real)) return real;
+  _earlyWrappedTargets.add(real);
+
+  // Critical: Proxy invariants forbid us from returning a different value for
+  // a non-configurable, non-writable property on the TARGET. Real Solflare
+  // 2.24+ ships its provider with `Object.freeze(r)` so every method is
+  // exactly that kind of property. To work around the invariant we attach
+  // the Proxy to an EMPTY (extensible, writable) target object and delegate
+  // every trap to `real` via Reflect. The invariant is satisfied because the
+  // proxied target has no own properties at all.
+  const wrappedMethodCache = new Map<string, unknown>();
+  const target = Object.create(null) as object;
+
+  const handler: ProxyHandler<object> = {
+    get(_t, prop) {
+      if (
+        prop === 'signMessage' ||
+        prop === 'signTransaction' ||
+        prop === 'signAllTransactions'
+      ) {
+        let cached = wrappedMethodCache.get(prop as string);
+        if (!cached) {
+          let raw: unknown;
+          try {
+            raw = Reflect.get(real, prop, real);
+          } catch {
+            raw = undefined;
+          }
+          if (typeof raw === 'function') {
+            cached = createProxyFn(
+              raw as (...args: unknown[]) => unknown,
+              prop as 'signMessage' | 'signTransaction' | 'signAllTransactions',
+            );
+            try {
+              Object.defineProperty(cached, '__solshield_wrapped', { value: true });
+            } catch { /* ignore */ }
+            wrappedMethodCache.set(prop as string, cached);
+          }
+        }
+        if (cached) return cached;
+      }
+      let v: unknown;
+      try {
+        v = Reflect.get(real, prop, real);
+      } catch {
+        return undefined;
+      }
+      if (typeof v === 'function') {
+        // Re-bind methods to the underlying real object so internal `this`
+        // bookkeeping (private state, event subscriptions) still works.
+        return (v as (...args: unknown[]) => unknown).bind(real);
+      }
+      return v;
+    },
+    has(_t, prop) {
+      try { return Reflect.has(real, prop); } catch { return false; }
+    },
+    ownKeys() {
+      try { return Reflect.ownKeys(real); } catch { return []; }
+    },
+    getOwnPropertyDescriptor(_t, prop) {
+      let raw: unknown;
+      try {
+        raw = Reflect.get(real, prop, real);
+      } catch {
+        return undefined;
+      }
+      if (raw === undefined) {
+        try {
+          // If the property exists but is undefined, still expose it.
+          if (!Reflect.has(real, prop)) return undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      // Fake the descriptor as configurable + writable so Proxy invariants
+      // don't constrain us. The dapp generally doesn't introspect these.
+      let value: unknown = raw;
+      if (
+        prop === 'signMessage' ||
+        prop === 'signTransaction' ||
+        prop === 'signAllTransactions'
+      ) {
+        value = wrappedMethodCache.get(prop as string) ?? raw;
+      } else if (typeof raw === 'function') {
+        value = (raw as (...args: unknown[]) => unknown).bind(real);
+      }
+      return { value, writable: true, enumerable: true, configurable: true };
+    },
+    set(_t, prop, value) {
+      try { return Reflect.set(real, prop, value, real); } catch { return false; }
+    },
+    deleteProperty(_t, prop) {
+      try { return Reflect.deleteProperty(real, prop); } catch { return false; }
+    },
+    getPrototypeOf() {
+      try { return Reflect.getPrototypeOf(real); } catch { return null; }
+    },
+    setPrototypeOf(_t, proto) {
+      try { return Reflect.setPrototypeOf(real, proto); } catch { return false; }
+    },
+    defineProperty(_t, prop, descriptor) {
+      try { return Reflect.defineProperty(real, prop, descriptor); } catch { return false; }
+    },
+    isExtensible() {
+      // Always report extensible — the proxied target IS extensible (we made
+      // it empty), and reporting otherwise would seal our Proxy on the dapp.
+      return true;
+    },
+    preventExtensions() {
+      // No-op — silently refuse so dapp code that calls Object.freeze on the
+      // provider doesn't accidentally lock us out.
+      return false;
+    },
+  };
+
+  return new Proxy(target, handler);
+}
+
+Object.defineProperty = function patchedDefineProperty<T>(
+  obj: T,
+  prop: PropertyKey,
+  descriptor: PropertyDescriptor,
+): T {
+  try {
+    if (
+      obj === window &&
+      typeof prop === 'string' &&
+      (prop === 'solana' || prop === 'solflare' || prop === 'phantom') &&
+      descriptor &&
+      'value' in descriptor &&
+      descriptor.value &&
+      typeof descriptor.value === 'object'
+    ) {
+      const original = descriptor.value as object;
+      const wrapped = wrapSealedProviderObject(original);
+      // Use _originalDefineProperty.call(...) so we don't recurse into
+      // ourselves. Pass a NEW descriptor with the wrapped value.
+      const newDescriptor = { ...descriptor, value: wrapped };
+      const result = _originalDefineProperty.call(Object, obj, prop, newDescriptor) as T;
+      // Defer logging to next microtask — at this point ensureStatus may not
+      // be ready (we're literally in the middle of module init).
+      queueMicrotask(() => {
+        try {
+          logEvent(
+            'info',
+            'install-sticky',
+            `early-defineProperty: wrapped window.${String(prop)} BEFORE wallet sealed it`,
+          );
+        } catch { /* ignore */ }
+      });
+      return result;
+    }
+  } catch (err) {
+    queueMicrotask(() => {
+      try {
+        logEvent(
+          'warn',
+          'install-sticky',
+          `early-defineProperty interceptor errored: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } catch { /* ignore */ }
+    });
+  }
+  return _originalDefineProperty.call(Object, obj, prop, descriptor) as T;
+} as typeof Object.defineProperty;
 
 // Symbol-keyed marker so a malicious dapp can't enumerate or spoof it.
 // (Earlier we used a string property which dapp could set on its own
@@ -543,6 +734,15 @@ function installStickyProxy(
   let wrapped = createProxyFn(original as (...args: unknown[]) => unknown, methodName);
   Object.defineProperty(wrapped, '__solshield_wrapped', { value: true });
 
+  // Real wallets (Solflare 2.24+, Phantom inpage) define provider methods with
+  // `writable:false, configurable:false`. defineProperty raises TypeError on
+  // such properties; assignment silently fails in non-strict mode. Either
+  // path can SUCCEED-LOOKING without actually replacing the function. We
+  // therefore VERIFY the install with a strict equality post-check and
+  // return false if the property still points at the original — the caller
+  // (patchProvider) then escalates to wrapping the parent provider object
+  // with a Proxy.
+  let installedVia: string | null = null;
   try {
     Object.defineProperty(provider, methodName, {
       configurable: true,
@@ -550,8 +750,6 @@ function installStickyProxy(
       get: () => wrapped,
       set: (newValue: unknown) => {
         if (typeof newValue === 'function') {
-          // If the incoming value is already wrapped, keep it as-is to avoid
-          // double-wrapping when SDKs round-trip the same fn through us.
           if ((newValue as { __solshield_wrapped?: boolean }).__solshield_wrapped) {
             wrapped = newValue as typeof wrapped;
           } else {
@@ -564,27 +762,168 @@ function installStickyProxy(
         }
       },
     });
-    logEvent('info', 'install-sticky', `${label}.${methodName} installed via defineProperty`);
-    return true;
-  } catch (err) {
+    installedVia = 'defineProperty';
+  } catch {
     try {
       provider[methodName] = wrapped;
-      logEvent('info', 'install-sticky', `${label}.${methodName} installed via direct assignment`);
-      return true;
+      installedVia = 'assignment';
     } catch (err2) {
-      logEvent('err', 'install-sticky', `${label}.${methodName} BOTH failed — defineProperty: ${err instanceof Error ? err.message : String(err)} | assignment: ${err2 instanceof Error ? err2.message : String(err2)}`);
+      logEvent(
+        'warn',
+        'install-sticky',
+        `${label}.${methodName}: defineProperty threw and assignment threw (${err2 instanceof Error ? err2.message : String(err2)}); wrap NOT installed — caller should escalate`,
+      );
       return false;
     }
   }
+
+  let actual: unknown;
+  try {
+    actual = provider[methodName];
+  } catch {
+    actual = undefined;
+  }
+  if (actual !== wrapped) {
+    logEvent(
+      'warn',
+      'install-sticky',
+      `${label}.${methodName}: ${installedVia} silently no-opped (sealed property) — wrap NOT installed, caller should escalate`,
+    );
+    return false;
+  }
+  logEvent('info', 'install-sticky', `${label}.${methodName} installed via ${installedVia}`);
+  return true;
+}
+
+/**
+ * When `installStickyProxy` can't replace a method on the provider (because
+ * the property is non-writable AND non-configurable, e.g. Solflare 2.24+ and
+ * Phantom's inpage that ship the provider as an Object.freeze-style sealed
+ * object), we wrap the entire provider object on its PARENT with a Proxy.
+ *
+ * The Proxy intercepts `get` of the sign* methods and returns our wrapper
+ * function; everything else passes through. Reading the original method
+ * directly via the underlying object is still possible for code that grabbed
+ * a reference earlier, but any code that reads `window.solflare.signMessage`
+ * AFTER our wrap installs gets the wrapper. Real Solflare's own internals
+ * use the underlying object directly so its connect/account flows still work.
+ *
+ * This is a fallback only — preferred path remains `installStickyProxy`.
+ * Returns true if we successfully replaced the parent's reference.
+ */
+function wrapEntireProvider(
+  parent: Record<string, unknown>,
+  key: string,
+  label: string,
+): boolean {
+  const target = parent[key];
+  if (!target || typeof target !== 'object') return false;
+  if ((target as { __solshield_provider_wrapped?: boolean }).__solshield_provider_wrapped) {
+    return true;
+  }
+
+  const wrappedMethods: Partial<Record<'signTransaction' | 'signAllTransactions' | 'signMessage', unknown>> = {};
+  const wrapMethod = (
+    name: 'signTransaction' | 'signAllTransactions' | 'signMessage',
+  ): unknown => {
+    if (wrappedMethods[name]) return wrappedMethods[name];
+    let raw: unknown;
+    try {
+      raw = (target as Record<string, unknown>)[name];
+    } catch {
+      return undefined;
+    }
+    if (typeof raw !== 'function') return raw;
+    if ((raw as { __solshield_wrapped?: boolean }).__solshield_wrapped) return raw;
+    const w = createProxyFn(raw as (...args: unknown[]) => unknown, name);
+    try {
+      Object.defineProperty(w, '__solshield_wrapped', { value: true });
+    } catch { /* ignore */ }
+    wrappedMethods[name] = w;
+    return w;
+  };
+
+  const proxy = new Proxy(target as object, {
+    get(t, prop, recv) {
+      if (
+        prop === 'signMessage' ||
+        prop === 'signTransaction' ||
+        prop === 'signAllTransactions'
+      ) {
+        const wf = wrapMethod(prop);
+        if (typeof wf === 'function') return wf;
+      }
+      const v = Reflect.get(t, prop, t);
+      if (typeof v === 'function') {
+        // Re-bind to the underlying object so methods like `request`,
+        // `connect`, etc work when the dapp calls them on the Proxy.
+        return v.bind(t);
+      }
+      return v;
+    },
+  });
+
+  try {
+    Object.defineProperty(target, '__solshield_provider_wrapped', { value: true });
+  } catch { /* ignore */ }
+
+  // Replace parent[key] with the Proxy. Verify post-write.
+  try {
+    Object.defineProperty(parent, key, {
+      configurable: true,
+      enumerable: true,
+      get: () => proxy,
+      set: () => { /* read-only — protect against re-assignment */ },
+    });
+  } catch {
+    try {
+      parent[key] = proxy;
+    } catch (err2) {
+      logEvent(
+        'warn',
+        'install-sticky',
+        `wrapEntireProvider(${label}): could not replace parent reference — ${err2 instanceof Error ? err2.message : String(err2)}`,
+      );
+      return false;
+    }
+  }
+  if (parent[key] !== proxy) {
+    logEvent(
+      'warn',
+      'install-sticky',
+      `wrapEntireProvider(${label}): parent.${key} did not stick (sealed). Wrap NOT installed.`,
+    );
+    return false;
+  }
+  logEvent('info', 'install-sticky', `wrapEntireProvider(${label}): wrapped via parent Proxy`);
+  return true;
 }
 
 /** Patch a provider object's signing methods (wallet-standard-agnostic legacy hook).
- *  Only marks the hook flag if at least one method was successfully patched. */
-function patchProvider(provider: Record<string, unknown>, label: string): void {
-  const okTx = installStickyProxy(provider, 'signTransaction', label);
-  const okTxs = installStickyProxy(provider, 'signAllTransactions', label);
-  const okMsg = installStickyProxy(provider, 'signMessage', label);
-  const anyPatched = okTx || okTxs || okMsg;
+ *  If installStickyProxy fails for ALL three methods (sealed properties), falls
+ *  back to wrapping the entire provider object on its parent with a Proxy.
+ *  Only marks the hook flag if at least one path succeeded. */
+function patchProvider(
+  parent: Record<string, unknown>,
+  key: string,
+  label: string,
+): void {
+  const provider = parent[key];
+  if (!provider || typeof provider !== 'object') return;
+  const p = provider as Record<string, unknown>;
+  const okTx = installStickyProxy(p, 'signTransaction', label);
+  const okTxs = installStickyProxy(p, 'signAllTransactions', label);
+  const okMsg = installStickyProxy(p, 'signMessage', label);
+  let anyPatched = okTx || okTxs || okMsg;
+
+  if (!anyPatched) {
+    // Sealed provider (Solflare 2.24+ and Phantom inpage do this) — escalate
+    // to a parent-level Proxy that intercepts on `get` of the sign* methods.
+    if (wrapEntireProvider(parent, key, label)) {
+      anyPatched = true;
+    }
+  }
+
   if (!anyPatched) return;
 
   const status = ensureStatus();
@@ -603,12 +942,10 @@ function initProviderPatching(): void {
   const checkProviders = (): void => {
     const w = window as unknown as Record<string, unknown>;
 
-    // Check window.solana (legacy)
     if (w.solana && typeof w.solana === 'object') {
-      patchProvider(w.solana as Record<string, unknown>, 'window.solana');
+      patchProvider(w, 'solana', 'window.solana');
     }
 
-    // Check window.phantom.solana
     if (
       w.phantom &&
       typeof w.phantom === 'object' &&
@@ -616,14 +953,14 @@ function initProviderPatching(): void {
       typeof (w.phantom as Record<string, unknown>).solana === 'object'
     ) {
       patchProvider(
-        (w.phantom as Record<string, unknown>).solana as Record<string, unknown>,
+        w.phantom as Record<string, unknown>,
+        'solana',
         'phantom.solana',
       );
     }
 
-    // Check window.solflare
     if (w.solflare && typeof w.solflare === 'object') {
-      patchProvider(w.solflare as Record<string, unknown>, 'solflare');
+      patchProvider(w, 'solflare', 'solflare');
     }
 
     attempts++;
