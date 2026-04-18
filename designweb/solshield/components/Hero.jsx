@@ -84,9 +84,9 @@ const Hero = ({ accent = 'triad' }) => {
 
           <p className="hero-sub">
             SolShield sits between your wallet and the signing prompt. It runs 23 deterministic
-            rules + Anthropic <b>Claude Opus 4.7</b> + <b>Haiku 4.5</b>, then shows you a
-            plain-English verdict <em>before</em> anything leaves your keys. Open source,
-            self-hostable, every rule and prompt in-tree.
+            rules + Anthropic <b>Claude Opus 4.7</b> + <b>Haiku 4.5</b> (<b>included by default —
+            no API key needed</b>), then shows you a plain-English verdict <em>before</em>
+            anything leaves your keys. Open source, self-hostable, every rule and prompt in-tree.
           </p>
 
           <div className="hero-cta">

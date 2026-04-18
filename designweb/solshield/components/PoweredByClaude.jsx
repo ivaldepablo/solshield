@@ -2,7 +2,7 @@
  * Differentiator vs Blockaid/Blowfish: we name the model, they don't. */
 
 const PoweredByClaude = () => (
-  <section className="section" id="claude" style={{paddingTop: 'clamp(56px, 8vw, 96px)', paddingBottom: 'clamp(56px, 8vw, 96px)'}}>
+  <section className="section" id="claude">
     <div className="container">
       <div className="section-head">
         <div>
@@ -93,13 +93,13 @@ const PoweredByClaude = () => (
         }}
       >
         <span style={{color: 'var(--ok, #00ff66)', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', fontSize: 11}}>
-          bring your own key
+          claude included by default · no api key needed
         </span>
         <div style={{marginTop: 6}}>
-          Self-host SolShield with your own <code>ANTHROPIC_API_KEY</code> environment
-          variable. Latency, cost, and rate limits are entirely under your control —
-          unlike Blockaid/Blowfish where the model belongs to them and you pay per call
-          to their endpoint.
+          Install the extension and the Claude analysis is on. Our hosted backend
+          covers every call — Haiku 4.5 + Opus 4.7 — at no cost to you. Want to run
+          it on your own infra? Self-host with <code>docker compose up</code> and
+          plug in your own <code>ANTHROPIC_API_KEY</code>. Both paths supported.
         </div>
       </div>
     </div>

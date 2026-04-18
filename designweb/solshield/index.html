@@ -321,7 +321,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 
 .hero {
   position: relative;
-  padding: clamp(48px, 9vw, 108px) 0 clamp(40px, 7vw, 80px);
+  padding: clamp(20px, 3vw, 36px) 0 clamp(16px, 2.5vw, 28px);
 }
 .hero-grid {
   display: grid;
@@ -334,14 +334,14 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 .hero-eyebrow {
   display: inline-flex; align-items: center; gap: 10px;
-  margin-bottom: 28px;
+  margin-bottom: 16px;
 }
 .hero-title {
   font-size: clamp(32px, 4.8vw, 58px);
   line-height: 1.02;
   letter-spacing: -0.03em;
   font-weight: 700;
-  margin: 0 0 22px;
+  margin: 0 0 14px;
   text-wrap: balance;
 }
 .hero-title .hi { color: var(--ok); }
@@ -363,13 +363,13 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
   font-size: clamp(15px, 1.4vw, 17px);
   color: var(--fg-1);
   max-width: 48ch;
-  margin: 0 0 32px;
-  line-height: 1.6;
+  margin: 0 0 18px;
+  line-height: 1.5;
   text-wrap: pretty;
 }
 .hero-cta {
   display: flex; flex-wrap: wrap; gap: 12px;
-  margin-bottom: 28px;
+  margin-bottom: 16px;
 }
 .hero-meta {
   display: flex; flex-wrap: wrap; gap: 20px 32px;
@@ -457,20 +457,20 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
    ========================================================================== */
 
 .section {
-  padding: clamp(56px, 8vw, 96px) 0;
+  padding: clamp(14px, 2vw, 22px) 0;
   position: relative;
 }
 .section-head {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 44px;
+  gap: 16px;
+  margin-bottom: 14px;
   flex-wrap: wrap;
 }
 .section-head h2 {
   margin: 0;
-  font-size: clamp(24px, 3vw, 36px);
+  font-size: clamp(22px, 2.6vw, 30px);
   letter-spacing: -0.02em;
   font-weight: 600;
   max-width: 28ch;
@@ -481,7 +481,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
   color: var(--fg-2);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  margin-bottom: 12px;
+  margin-bottom: 6px;
   display: flex; align-items: center; gap: 10px;
 }
 .section-head .kicker::before {
@@ -511,7 +511,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 @media (max-width: 800px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 .stat {
-  padding: 28px 24px;
+  padding: 16px 20px;
   border-right: 1px solid var(--br-1);
 }
 .stat:last-child { border-right: 0; }
@@ -776,19 +776,19 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 @media (max-width: 600px) { .features-grid { grid-template-columns: 1fr; } }
 .feat {
   background: var(--bg-1);
-  padding: 28px 24px 30px;
+  padding: 18px 18px 20px;
   position: relative;
   transition: background 0.15s;
 }
 .feat:hover { background: var(--bg-2); }
 .feat-icon {
-  width: 36px; height: 36px;
+  width: 32px; height: 32px;
   display: grid; place-items: center;
   border: 1px solid var(--br-2);
   background: var(--bg-0);
   border-radius: 4px;
   color: var(--ok);
-  margin-bottom: 18px;
+  margin-bottom: 12px;
   font-family: var(--mono);
   font-weight: 700;
   font-size: 13px;
@@ -909,11 +909,14 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 .wallet:hover { background: var(--bg-2); }
 .wallet .glyph {
   width: 28px; height: 28px;
-  border-radius: 5px;
+  border-radius: 6px;
   display: grid; place-items: center;
-  font-weight: 700; font-size: 12px;
-  color: #fff;
   flex-shrink: 0;
+  overflow: hidden;
+}
+.wallet .glyph svg, .wallet .glyph img {
+  width: 100%; height: 100%;
+  display: block;
 }
 .wallet .name { color: var(--fg-0); font-weight: 500; }
 .wallet .state {
@@ -936,7 +939,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
     var(--bg-1);
   border: 1px solid var(--br-1);
   border-radius: var(--radius-lg);
-  padding: 40px;
+  padding: 28px;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 32px;
@@ -1310,9 +1313,9 @@ const Hero = ({ accent = 'triad' }) => {
 
           <p className="hero-sub">
             SolShield sits between your wallet and the signing prompt. It runs 23 deterministic
-            rules + Anthropic <b>Claude Opus 4.7</b> + <b>Haiku 4.5</b>, then shows you a
-            plain-English verdict <em>before</em> anything leaves your keys. Open source,
-            self-hostable, every rule and prompt in-tree.
+            rules + Anthropic <b>Claude Opus 4.7</b> + <b>Haiku 4.5</b> (<b>included by default —
+            no API key needed</b>), then shows you a plain-English verdict <em>before</em>
+            anything leaves your keys. Open source, self-hostable, every rule and prompt in-tree.
           </p>
 
           <div className="hero-cta">
@@ -1502,7 +1505,7 @@ const FEATURES = [
 ];
 
 const Features = () => (
-  <section className="section" id="features" style={{paddingTop: 'clamp(72px, 10vw, 112px)'}}>
+  <section className="section" id="features">
     <div className="container">
       <div className="section-head">
         <div>
@@ -1536,7 +1539,7 @@ window.Features = Features;
  * Differentiator vs Blockaid/Blowfish: we name the model, they don't. */
 
 const PoweredByClaude = () => (
-  <section className="section" id="claude" style={{paddingTop: 'clamp(56px, 8vw, 96px)', paddingBottom: 'clamp(56px, 8vw, 96px)'}}>
+  <section className="section" id="claude">
     <div className="container">
       <div className="section-head">
         <div>
@@ -1627,13 +1630,13 @@ const PoweredByClaude = () => (
         }}
       >
         <span style={{color: 'var(--ok, #00ff66)', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', fontSize: 11}}>
-          bring your own key
+          claude included by default · no api key needed
         </span>
         <div style={{marginTop: 6}}>
-          Self-host SolShield with your own <code>ANTHROPIC_API_KEY</code> environment
-          variable. Latency, cost, and rate limits are entirely under your control —
-          unlike Blockaid/Blowfish where the model belongs to them and you pay per call
-          to their endpoint.
+          Install the extension and the Claude analysis is on. Our hosted backend
+          covers every call — Haiku 4.5 + Opus 4.7 — at no cost to you. Want to run
+          it on your own infra? Self-host with <code>docker compose up</code> and
+          plug in your own <code>ANTHROPIC_API_KEY</code>. Both paths supported.
         </div>
       </div>
     </div>
@@ -1939,14 +1942,84 @@ const Comparison = () => (
 window.Comparison = Comparison;
 
 /* ==== Wallets.jsx ==== */
+/* Real wallet logos — simplified inline SVGs that respect each wallet's brand
+ * color. Replaces the previous letter-glyph placeholders. */
+
+const PhantomLogo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Phantom">
+    <rect width="128" height="128" rx="22" fill="#AB9FF2" />
+    <path d="M110.6 64C110.6 38.3 89.7 17.4 64 17.4S17.4 38.3 17.4 64c0 23.4 17.3 42.7 39.8 46v-23.2H47.7c-2.7 0-4.9-2.2-4.9-4.9V47.6c0-2.7 2.2-4.9 4.9-4.9h32.6c2.7 0 4.9 2.2 4.9 4.9v34.3c0 2.7-2.2 4.9-4.9 4.9H70.8V110c22.5-3.3 39.8-22.6 39.8-46z" fill="#FFF"/>
+    <circle cx="55" cy="62" r="5.5" fill="#AB9FF2"/>
+    <circle cx="78" cy="62" r="5.5" fill="#AB9FF2"/>
+  </svg>
+);
+
+const SolflareLogo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Solflare">
+    <defs>
+      <linearGradient id="sf-g" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stopColor="#FFC10B"/>
+        <stop offset="100%" stopColor="#FB6116"/>
+      </linearGradient>
+    </defs>
+    <rect width="128" height="128" rx="22" fill="#0E0E0E"/>
+    <circle cx="64" cy="64" r="34" fill="url(#sf-g)"/>
+    <circle cx="64" cy="64" r="14" fill="#0E0E0E"/>
+  </svg>
+);
+
+const BackpackLogo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Backpack">
+    <rect width="128" height="128" rx="22" fill="#E33E3F"/>
+    <path d="M40 38h48v52H40z" fill="#FFF" opacity="0.95"/>
+    <rect x="50" y="30" width="28" height="14" rx="6" fill="none" stroke="#FFF" strokeWidth="4"/>
+    <rect x="48" y="60" width="32" height="6" rx="2" fill="#E33E3F"/>
+  </svg>
+);
+
+const GlowLogo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Glow">
+    <defs>
+      <radialGradient id="gl-g" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stopColor="#FFE066"/>
+        <stop offset="100%" stopColor="#FFB800"/>
+      </radialGradient>
+    </defs>
+    <rect width="128" height="128" rx="22" fill="#1A1A1A"/>
+    <circle cx="64" cy="64" r="42" fill="url(#gl-g)"/>
+    <circle cx="64" cy="64" r="42" fill="none" stroke="#FFE066" strokeWidth="2" opacity="0.4"/>
+  </svg>
+);
+
+const TrustLogo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Trust Wallet">
+    <rect width="128" height="128" rx="22" fill="#0500FF"/>
+    <path d="M64 28L40 38v22c0 18 11 33 24 40 13-7 24-22 24-40V38L64 28z" fill="#FFF"/>
+  </svg>
+);
+
+const Coin98Logo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Coin98">
+    <rect width="128" height="128" rx="22" fill="#D4B04A"/>
+    <path d="M64 24c22 0 40 18 40 40s-18 40-40 40-40-18-40-40 18-40 40-40zm0 14c-14.4 0-26 11.6-26 26s11.6 26 26 26c8 0 15.2-3.6 20-9.4l-9.4-7.4c-2.6 3.2-6.6 5.2-10.6 5.2-7.6 0-13.4-5.8-13.4-14.4 0-8.6 5.8-14.4 13.4-14.4 4 0 8 2 10.6 5.2L84 47.4C79.2 41.6 72 38 64 38z" fill="#0E0E0E"/>
+  </svg>
+);
+
+const StandardLogo = () => (
+  <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Wallet Standard">
+    <rect width="128" height="128" rx="22" fill="#0E0E0E"/>
+    <text x="64" y="86" textAnchor="middle" fontFamily="JetBrains Mono, monospace" fontSize="68" fontWeight="700" fill="#00FF66">§</text>
+  </svg>
+);
+
 const WALLETS = [
-  { name: 'Phantom',   bg: '#ab9ff2', ch: 'P', state: 'supported' },
-  { name: 'Solflare',  bg: '#fc7227', ch: 'S', state: 'supported' },
-  { name: 'Backpack',  bg: '#e33e3f', ch: 'B', state: 'supported' },
-  { name: 'Glow',      bg: '#ffb800', ch: 'G', state: 'supported' },
-  { name: 'Trust',     bg: '#3375bb', ch: 'T', state: 'supported' },
-  { name: 'Coin98',    bg: '#d4b04a', ch: 'C', state: 'supported' },
-  { name: 'wallet-standard', bg: '#00ff66', ch: '§', state: 'supported' },
+  { name: 'Phantom',           Logo: PhantomLogo,  state: 'supported' },
+  { name: 'Solflare',          Logo: SolflareLogo, state: 'supported' },
+  { name: 'Backpack',          Logo: BackpackLogo, state: 'supported' },
+  { name: 'Glow',              Logo: GlowLogo,     state: 'supported' },
+  { name: 'Trust',             Logo: TrustLogo,    state: 'supported' },
+  { name: 'Coin98',            Logo: Coin98Logo,   state: 'supported' },
+  { name: 'wallet-standard',   Logo: StandardLogo, state: 'supported' },
 ];
 
 const Wallets = () => (
@@ -1959,20 +2032,24 @@ const Wallets = () => (
         </div>
         <p>
           Every major Solana wallet plus anything that implements the wallet-standard
-          spec. No RPC hijack, no permission escalation.
+          spec. No RPC hijack, no permission escalation. All 6 wallets below verified
+          live against magiceden + jupiter + tensor.
         </p>
       </div>
 
       <div className="wallets">
-        {WALLETS.map(w => (
-          <div className="wallet" key={w.name} title={`${w.name} · ${w.state}`}>
-            <div className="glyph" style={{background: w.bg, color: w.bg === '#ffb800' || w.bg === '#00ff66' ? '#000' : '#fff'}}>{w.ch}</div>
-            <span className="name">{w.name}</span>
-            <span className={`state ${w.state !== 'supported' ? w.state : ''}`}>
-              {w.state === 'supported' ? '●' : w.state === 'beta' ? 'β' : '…'}
-            </span>
-          </div>
-        ))}
+        {WALLETS.map(w => {
+          const Logo = w.Logo;
+          return (
+            <div className="wallet" key={w.name} title={`${w.name} · ${w.state}`}>
+              <div className="glyph"><Logo /></div>
+              <span className="name">{w.name}</span>
+              <span className={`state ${w.state !== 'supported' ? w.state : ''}`}>
+                {w.state === 'supported' ? '●' : w.state === 'beta' ? 'β' : '…'}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   </section>

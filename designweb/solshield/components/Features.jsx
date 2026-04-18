@@ -56,7 +56,7 @@ const FEATURES = [
 ];
 
 const Features = () => (
-  <section className="section" id="features" style={{paddingTop: 'clamp(72px, 10vw, 112px)'}}>
+  <section className="section" id="features">
     <div className="container">
       <div className="section-head">
         <div>
