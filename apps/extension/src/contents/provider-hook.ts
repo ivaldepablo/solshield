@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.2.0';
+const SOLSHIELD_VERSION = '0.2.1';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
@@ -1118,15 +1118,26 @@ function wrapWalletWithProxy(wallet: WalletStandardWallet): WalletStandardWallet
   }
 
   const featureProxyCache = new WeakMap<object, unknown>();
+  // CRITICAL: cache the features Proxy so wallet.features returns the SAME
+  // object every time. Otherwise React sees a new object on every render,
+  // thinks state changed, hits hydration error #418, and re-renders forever.
+  // (DynamicSDK on magiceden.io was crashing because of exactly this.)
+  let featuresProxyMemo: unknown = undefined;
+  let featuresOriginalMemo: unknown = undefined;
 
   const proxied = new Proxy(wallet, {
     get(target, prop, receiver) {
       if (prop !== 'features') return Reflect.get(target, prop, receiver);
       const features = Reflect.get(target, prop, receiver);
       if (!features || typeof features !== 'object') return features;
+      // If the underlying features object is the same as last time, return
+      // the SAME proxy. Wallet usually keeps features stable, so this hits
+      // 99%+ of the time and gives React the reference equality it needs.
+      if (featuresOriginalMemo === features && featuresProxyMemo) return featuresProxyMemo;
+      featuresOriginalMemo = features;
       const featuresObj = features as Record<string, unknown>;
 
-      return new Proxy(featuresObj, {
+      const featuresProxy = new Proxy(featuresObj, {
         get(fTarget, fKey) {
           const feature = Reflect.get(fTarget, fKey);
           if (!feature || typeof feature !== 'object') return feature;
@@ -1158,6 +1169,8 @@ function wrapWalletWithProxy(wallet: WalletStandardWallet): WalletStandardWallet
           return featureProxy;
         },
       });
+      featuresProxyMemo = featuresProxy;
+      return featuresProxy;
     },
   });
 
