@@ -13,7 +13,13 @@ interface RateLimitOpts {
 }
 
 const DEFAULT_WINDOW_SECONDS = 60;
-const DEFAULT_MAX = 10;
+// 120 req/min/IP (~2/sec average). The previous 10/min cap caused fail-open
+// on real wallets like Phantom, which retry SIWS multiple times during a
+// single signature flow and would burn through the quota in seconds. The
+// extension treats 429 as "offline" and lets the signature pass without an
+// overlay, so a too-tight limit is actively a security regression. 120 leaves
+// plenty of room for SIWS retries + dev testing while still blocking abuse.
+const DEFAULT_MAX = 120;
 
 type GlobalWithRedis = typeof globalThis & {
   __solshieldRedis?: Redis | null;

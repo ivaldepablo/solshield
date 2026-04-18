@@ -15,6 +15,7 @@
 import type { PlasmoCSConfig } from 'plasmo';
 import { createElement } from 'react';
 import { Overlay } from '../components/Overlay';
+import { Banner } from '../components/Banner';
 import { mountInShadow } from '../lib/shadow-dom';
 import { inspectTx, inspectMessage } from '../lib/api-client';
 import type { ContentResponse, InpageRequest, VerdictView } from '../lib/messaging';
@@ -50,13 +51,123 @@ function randomHostId(): string {
 }
 
 const HOST_ID = randomHostId();
+const BANNER_HOST_ID = `${HOST_ID}-banner`;
 const OVERLAY_TIMEOUT_MS = 60_000;
 const MAX_REATTACH_ATTEMPTS = 5;
+// Banner sits for up to 90s after the overlay closes, then self-dismisses so
+// we don't pollute the dapp page indefinitely. Long enough that a slow user
+// alt-tabbing through Phantom + back still sees it.
+const BANNER_LIFETIME_MS = 90_000;
 
 function postContentResponse(message: ContentResponse): void {
   // postMessage to self — the page's MAIN world will see it via its own
   // window.addEventListener('message', ...).
   window.postMessage(message, '*');
+}
+
+/**
+ * Layer 1 of focus-steal defense — fire a chrome.notifications toast via the
+ * background SW. The toast is rendered by the OS (not Chrome's tab compositor)
+ * so it remains visible even when Phantom's notification.html tab fullscreen-
+ * focuses itself after the user clicks PROCEED.
+ *
+ * chrome.notifications is not available in MAIN world but IS available from
+ * ISOLATED-world content scripts (this file) via chrome.runtime.sendMessage to
+ * the SW. We do it as a SW round-trip rather than direct because permission
+ * scope is cleaner and we want chrome.tabs.update access from the click handler.
+ *
+ * Best-effort, fire-and-forget. Layer 2 (Banner) is the safety net. The SW
+ * also flips Layer 3 (toolbar-icon badge) inside this same handler.
+ */
+function fireSystemNotification(verdict: VerdictView): void {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+    let hostname = '';
+    try {
+      hostname = location.hostname || location.host || 'this site';
+    } catch {
+      hostname = 'this site';
+    }
+    chrome.runtime.sendMessage(
+      { type: 'show-system-notification', verdict, hostname },
+      () => {
+        // chrome.runtime.lastError can fire if the SW is asleep / no listener.
+        // Either way we don't care — it's a best-effort side channel.
+        const _err = chrome.runtime.lastError;
+        if (_err) {
+          // ignore
+        }
+      },
+    );
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Layer 3 cleanup — ask the SW to wipe the toolbar badge for this tab.
+ * Called from:
+ *   1. Banner onDismiss (user clicked the × on the persistent banner).
+ *   2. Banner auto-dismiss timer (90s lifetime expired).
+ *   3. Overlay reject path (no banner mounts there, but the badge was set in
+ *      parallel via fireSystemNotification → must clean up explicitly).
+ */
+function clearWarningBadge(): void {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+    chrome.runtime.sendMessage({ type: 'clear-warning-badge' }, () => {
+      const _err = chrome.runtime.lastError;
+      if (_err) {
+        // ignore — best effort
+      }
+    });
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Layer 2 of focus-steal defense — mount a persistent banner on the dapp page
+ * so when the user comes back to this tab after interacting with the wallet's
+ * notification.html, they still see the verdict. Independent host element +
+ * shadow root so the overlay's lifecycle doesn't kill it.
+ */
+function mountPersistentBanner(verdict: VerdictView): void {
+  try {
+    document.getElementById(BANNER_HOST_ID)?.remove();
+
+    const host = document.createElement('div');
+    host.id = BANNER_HOST_ID;
+    document.body.appendChild(host);
+
+    let unmount: (() => void) | null = null;
+    let cleared = false;
+    const cleanup = (): void => {
+      try { unmount?.(); } catch { /* ignore */ }
+      unmount = null;
+      try { host.remove(); } catch { /* ignore */ }
+      // Layer 3: idempotently clear the toolbar badge. The banner can be torn
+      // down via the user clicking ×, the auto-dismiss timer, or both back-
+      // to-back — we only want to message the SW once.
+      if (!cleared) {
+        cleared = true;
+        clearWarningBadge();
+      }
+    };
+
+    unmount = mountInShadow(
+      host,
+      createElement(Banner, {
+        verdict,
+        onDismiss: cleanup,
+      }),
+    );
+
+    // Auto-dismiss after BANNER_LIFETIME_MS so we don't hang around forever.
+    _setTimeout(cleanup, BANNER_LIFETIME_MS);
+  } catch (err) {
+    postLogEntry('warn', 'banner', `mount failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** Send a log entry to MAIN world's __solshield.log via postMessage.
@@ -117,6 +228,11 @@ async function showOverlayAndAwaitDecision(
 ): Promise<'proceed' | 'reject'> {
   document.getElementById(HOST_ID)?.remove();
 
+  // Layer 1 fires in PARALLEL with the overlay mount — the user may be
+  // about to alt-tab to Phantom's notification.html, so we want the OS toast
+  // up immediately, not after they decide.
+  fireSystemNotification(verdict);
+
   const host = document.createElement('div');
   host.id = HOST_ID;
   document.body.appendChild(host);
@@ -164,12 +280,34 @@ async function showOverlayAndAwaitDecision(
   });
   observer.observe(document.body, { childList: true, subtree: false });
 
+  let bannerWillOwnBadge = false;
   try {
-    return await waitForUserDecision(signal);
+    const decision = await waitForUserDecision(signal);
+    // Layer 2: when the user PROCEEDs, leave a persistent banner so when
+    // they return to this dapp tab from the wallet's notification.html they
+    // can still see what we flagged. We don't show it on REJECT since the
+    // tx never goes to the wallet — banner would be noise.
+    if (decision === 'proceed') {
+      mountPersistentBanner(verdict);
+      // Banner cleanup will fire clearWarningBadge() — don't double-clear.
+      bannerWillOwnBadge = true;
+    } else {
+      // Layer 3 cleanup on reject: the badge was set in parallel via
+      // fireSystemNotification, but no banner mounts on the reject path —
+      // without an explicit clear here the badge would linger forever.
+      clearWarningBadge();
+    }
+    return decision;
   } finally {
     observer.disconnect();
     try { unmount(); } catch { /* ignore */ }
     host.remove();
+    // If we exited via throw (e.g. waitForUserDecision timed out) no banner
+    // was mounted and the reject branch above never ran — clear the badge so
+    // it doesn't linger after a failed decision wait.
+    if (!bannerWillOwnBadge && signal.decision !== 'reject') {
+      clearWarningBadge();
+    }
   }
 }
 
