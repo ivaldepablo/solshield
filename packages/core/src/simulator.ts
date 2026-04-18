@@ -47,6 +47,14 @@ export interface TokenDiff {
   preAmount: bigint;
   postAmount: bigint;
   deltaAmount: bigint;
+  /** SPL token account state byte: false = initialized (normal), true = frozen.
+   *  A drainer pattern is to flip frozen=true so the user can\'t move tokens
+   *  even though amount stays > 0; that change wouldn\'t produce an amount diff
+   *  so we surface it as a separate signal. */
+  preFrozen: boolean;
+  postFrozen: boolean;
+  /** True when this token account is owned by the tx signer (account index 0). */
+  ownedBySigner: boolean;
 }
 
 export interface SimulationResult {
@@ -76,16 +84,25 @@ const SPL_TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const TOKEN_ACCOUNT_LEN = 165;
 
 // SPL Token account layout:
-// 0..32   mint     : Pubkey
-// 32..64  owner    : Pubkey
-// 64..72  amount   : u64 LE
-// remaining fields omitted (delegate, state, delegated_amount, close_authority, is_native)
+//   0..32    mint     : Pubkey
+//   32..64   owner    : Pubkey
+//   64..72   amount   : u64 LE
+//   72..108  delegate : COption<Pubkey>  (4 byte tag + 32 byte key)
+//   108      state    : AccountState (1 byte: 0=Uninit, 1=Initialized, 2=Frozen)
+//   109..    is_native + delegated_amount + close_authority (omitted)
 function isTokenAccount(data: Uint8Array, owner: string): boolean {
   if (owner !== SPL_TOKEN_PROGRAM && owner !== SPL_TOKEN_2022_PROGRAM) return false;
   return data.length >= TOKEN_ACCOUNT_LEN;
 }
 
-function parseTokenAccount(data: Uint8Array): { mint: string; owner: string; amount: bigint } {
+const TOKEN_ACCOUNT_STATE_FROZEN = 2;
+
+function parseTokenAccount(data: Uint8Array): {
+  mint: string;
+  owner: string;
+  amount: bigint;
+  frozen: boolean;
+} {
   const mint = encodePubkey(data.slice(0, 32));
   const owner = encodePubkey(data.slice(32, 64));
   let amount = 0n;
@@ -93,7 +110,8 @@ function parseTokenAccount(data: Uint8Array): { mint: string; owner: string; amo
     const byte = data[i];
     amount = (amount << 8n) | BigInt(byte ?? 0);
   }
-  return { mint, owner, amount };
+  const frozen = (data[108] ?? 0) === TOKEN_ACCOUNT_STATE_FROZEN;
+  return { mint, owner, amount, frozen };
 }
 
 // -------- account writability per message header --------
@@ -173,7 +191,14 @@ export async function simulate(
     if (pre && post && isTokenAccount(pre.data, pre.owner) && isTokenAccount(post.data, post.owner)) {
       const preTok = parseTokenAccount(pre.data);
       const postTok = parseTokenAccount(post.data);
-      if (preTok.amount !== postTok.amount) {
+      const amountChanged = preTok.amount !== postTok.amount;
+      const frozenChanged = preTok.frozen !== postTok.frozen;
+      // Surface the diff if EITHER amount changed or frozen state changed.
+      // Frozen-state attacks (drainer flips state then swaps authority) leave
+      // amount unchanged so the old amount-only check missed them entirely.
+      if (amountChanged || frozenChanged) {
+        const signerKey = encodePubkey(tx.message.accountKeys[0]!);
+        const ownedBySigner = preTok.owner === signerKey;
         tokenDiffs.push({
           accountIndex: i,
           account,
@@ -182,6 +207,9 @@ export async function simulate(
           preAmount: preTok.amount,
           postAmount: postTok.amount,
           deltaAmount: postTok.amount - preTok.amount,
+          preFrozen: preTok.frozen,
+          postFrozen: postTok.frozen,
+          ownedBySigner,
         });
       }
     }

@@ -613,11 +613,18 @@ export const simulatedTokenWipe: Rule = {
   },
 };
 
-// -------- rule 15: simulation-failure (informational) --------
+// -------- rule 15: simulation-failure --------
 
 export const simulationFailure: Rule = {
   id: 'simulation-failure',
-  severity: 'low',
+  // medium (was low). A failing simulation isn't always a drainer signal but
+  // it's WAY more often a red flag than not — drainers commonly craft txs
+  // that pass static rules but reverse on-chain (anti-detection: simulate
+  // gives them more uniform behaviour to avoid suspicion later, OR they rely
+  // on a state change that hasn't happened yet). At low (weight 10) it never
+  // moves the verdict above safe. At medium (weight 25) it tips into
+  // suspicious so the user at least sees the overlay.
+  severity: 'medium',
   description: 'Dynamic simulation failed. The transaction would revert on-chain.',
 
   evaluate(ctx) {
@@ -626,11 +633,43 @@ export const simulationFailure: Rule = {
     return [
       {
         ruleId: 'simulation-failure',
-        severity: 'low',
-        message: `Transaction would fail on-chain: ${sim.error ?? 'unknown error'}.`,
+        severity: 'medium',
+        message: `Transaction would fail on-chain: ${sim.error ?? 'unknown error'}. This is unusual for a legitimate signing flow.`,
         details: { error: sim.error, logs: sim.logs.slice(-5) },
       },
     ];
+  },
+};
+
+// -------- rule 16: simulated-token-frozen --------
+
+export const simulatedTokenFrozen: Rule = {
+  id: 'simulated-token-frozen',
+  severity: 'high',
+  description:
+    'Simulation shows one of the signer\'s token accounts being frozen. Often combined with an authority swap to drain.',
+
+  evaluate(ctx) {
+    const sim = ctx.simulation;
+    if (!sim || !sim.success) return [];
+    const findings: Finding[] = [];
+    for (const diff of sim.tokenDiffs) {
+      if (!diff.ownedBySigner) continue;
+      if (diff.preFrozen === false && diff.postFrozen === true) {
+        findings.push({
+          ruleId: 'simulated-token-frozen',
+          severity: 'high',
+          message: `Simulation shows your token account for mint ${diff.mint} would be FROZEN. Once frozen, you can't move the tokens — drainers use this to lock you out before swapping authority.`,
+          details: {
+            mint: diff.mint,
+            account: diff.account,
+            preAmount: String(diff.preAmount),
+            postAmount: String(diff.postAmount),
+          },
+        });
+      }
+    }
+    return findings;
   },
 };
 
@@ -652,6 +691,7 @@ export const BUILTIN_RULES: Rule[] = [
   simulatedSignerDrain,
   simulatedTokenWipe,
   simulationFailure,
+  simulatedTokenFrozen,
 ];
 
 const SEVERITY_WEIGHT: Record<Finding['severity'], number> = {

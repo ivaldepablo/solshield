@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.7';
+const SOLSHIELD_VERSION = '0.4.8';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
@@ -1688,8 +1688,19 @@ function wrapSigningInvocation(
   return wrapper;
 }
 
-/** Direct fetch to the SolShield API from MAIN world. Returns null on failure
- *  (so caller can decide to fail-open). 8s timeout. */
+/** Direct fetch to the SolShield API from MAIN world.
+ *
+ *  Three outcomes:
+ *    - server returned a verdict → return it.
+ *    - server returned 429/5xx (rate-limit or server error) → return a
+ *      SYNTHETIC suspicious verdict so the overlay still mounts and the user
+ *      decides. Earlier we returned null on these and the caller fail-opened
+ *      silently — that meant Phantom popup appeared without our overlay
+ *      whenever the API was overloaded. v0.4.8 fail-CLOSED on these.
+ *    - true offline (network error / timeout) → return null. Caller may
+ *      fail-open since the failure is on the user's side.
+ *
+ *  Timeout 12s (was 8s) — leaves headroom for cold-start on the first call. */
 async function getVerdict(
   endpoint: 'inspect-message' | 'inspect',
   body: Record<string, unknown>,
@@ -1697,10 +1708,8 @@ async function getVerdict(
   const url = `https://solshield.dev/api/${endpoint}`;
   logEvent('info', 'verdict-fetch', `→ ${endpoint}`);
   try {
-    // Use stashed native APIs — protects against dapps that hijack window.fetch
-    // or AbortController to feed us forged "safe" verdicts.
     const ctrl = new NATIVE.AbortController();
-    const timer = NATIVE.setTimeout(() => ctrl.abort(), 8000);
+    const timer = NATIVE.setTimeout(() => ctrl.abort(), 12_000);
     const res = await NATIVE.fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1708,6 +1717,22 @@ async function getVerdict(
       signal: ctrl.signal,
     });
     NATIVE.clearTimeout(timer);
+    if (res.status === 429) {
+      logEvent('warn', 'verdict-fetch', 'HTTP 429 → synthetic suspicious (fail-CLOSED on rate limit)');
+      return {
+        verdict: 'suspicious',
+        summary:
+          'SolShield rate-limited; could not analyze this signature. Verify the message in your wallet popup before signing.',
+      };
+    }
+    if (res.status >= 500 && res.status < 600) {
+      logEvent('warn', 'verdict-fetch', `HTTP ${res.status} → synthetic suspicious (fail-CLOSED on server error)`);
+      return {
+        verdict: 'suspicious',
+        summary:
+          'SolShield backend error; could not analyze this signature. Verify the message in your wallet popup before signing.',
+      };
+    }
     if (!res.ok) {
       logEvent('warn', 'verdict-fetch', `HTTP ${res.status}`);
       return null;
