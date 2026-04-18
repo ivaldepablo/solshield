@@ -210,6 +210,12 @@ export function checkDomain(url: string): DomainCheckResult {
   }
 
   // 5. Typosquat detection via Levenshtein distance against legit dapps.
+  //    Distance alone is too aggressive on short hostnames: `tensor.io` vs
+  //    `tensor.trade` is distance=2 but BOTH are legitimate-looking. We
+  //    normalize by max-length so a 2-edit gap on a 5-char hostname (40%
+  //    different) does NOT flag, but a 1-edit on a 12-char hostname (~8%)
+  //    still does. Also require an absolute distance >= 1 and the longer
+  //    hostname >= 6 chars to avoid noise on tiny strings.
   if (!legitDappsSet.has(hostname)) {
     let bestLegit: string | null = null;
     let bestDistance = Number.MAX_SAFE_INTEGER;
@@ -221,12 +227,16 @@ export function checkDomain(url: string): DomainCheckResult {
       }
     }
     if (bestLegit && bestDistance > 0 && bestDistance <= 2) {
-      reasons.push({
-        code: 'typosquat',
-        severity: 'high',
-        message: `${hostname} looks like a typosquat of ${bestLegit} (edit distance ${bestDistance}).`,
-        details: { spoofing: bestLegit, distance: bestDistance },
-      });
+      const longer = Math.max(hostname.length, bestLegit.length);
+      const editRate = bestDistance / longer;
+      if (longer >= 6 && editRate <= 0.15) {
+        reasons.push({
+          code: 'typosquat',
+          severity: 'high',
+          message: `${hostname} looks like a typosquat of ${bestLegit} (edit distance ${bestDistance}).`,
+          details: { spoofing: bestLegit, distance: bestDistance, editRate },
+        });
+      }
     }
   }
 

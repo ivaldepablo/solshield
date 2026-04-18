@@ -18,10 +18,28 @@ const DEFAULT_MAX = 10;
 type GlobalWithRedis = typeof globalThis & {
   __solshieldRedis?: Redis | null;
   __solshieldRedisUnavailable?: boolean;
-  __solshieldRedisWarned?: boolean;
+  __solshieldRedisLastWarnAt?: number;
+  __solshieldFailOpenCount?: number;
 };
 
 const g = globalThis as GlobalWithRedis;
+const WARN_INTERVAL_MS = 60_000;
+
+function maybeWarn(msg: string): void {
+  const now = Date.now();
+  if (!g.__solshieldRedisLastWarnAt || now - g.__solshieldRedisLastWarnAt > WARN_INTERVAL_MS) {
+    g.__solshieldRedisLastWarnAt = now;
+    const failedSince = g.__solshieldFailOpenCount ?? 0;
+    console.warn(
+      `[rate-limit] ${msg} (fail-open requests since last warn: ${failedSince})`,
+    );
+    g.__solshieldFailOpenCount = 0;
+  }
+}
+
+function recordFailOpen(): void {
+  g.__solshieldFailOpenCount = (g.__solshieldFailOpenCount ?? 0) + 1;
+}
 
 function getRedis(): Redis | null {
   if (g.__solshieldRedisUnavailable) return null;
@@ -29,10 +47,7 @@ function getRedis(): Redis | null {
 
   const url = process.env.REDIS_URL;
   if (!url) {
-    if (!g.__solshieldRedisWarned) {
-      console.warn('[rate-limit] REDIS_URL not set; rate limiting disabled (fail-open)');
-      g.__solshieldRedisWarned = true;
-    }
+    maybeWarn('REDIS_URL not set; rate limiting disabled');
     g.__solshieldRedisUnavailable = true;
     return null;
   }
@@ -48,10 +63,7 @@ function getRedis(): Redis | null {
 
   const client = new Redis(url, opts);
   client.on('error', (err) => {
-    if (!g.__solshieldRedisWarned) {
-      console.warn(`[rate-limit] redis error: ${(err as Error).message} — failing open`);
-      g.__solshieldRedisWarned = true;
-    }
+    maybeWarn(`redis error: ${(err as Error).message}`);
   });
 
   g.__solshieldRedis = client;
@@ -71,7 +83,7 @@ export async function checkRateLimit(
 
   const client = getRedis();
   if (!client) {
-    // fail-open if redis is down — we'd rather serve than 503
+    recordFailOpen();
     return { allowed: true, remaining: Infinity, resetAt: now, limit: max };
   }
 
@@ -102,10 +114,8 @@ export async function checkRateLimit(
         /* ignore */
       }
     })();
-    if (!g.__solshieldRedisWarned) {
-      console.warn(`[rate-limit] redis call failed: ${(err as Error).message} — failing open`);
-      g.__solshieldRedisWarned = true;
-    }
+    maybeWarn(`redis call failed: ${(err as Error).message}`);
+    recordFailOpen();
     return { allowed: true, remaining: Infinity, resetAt: now, limit: max };
   }
 }

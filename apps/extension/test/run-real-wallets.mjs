@@ -30,7 +30,7 @@ const REAL_PHANTOM = resolve(__dirname, 'real-wallets', 'phantom');
 const REAL_SOLFLARE = resolve(__dirname, 'real-wallets', 'solflare');
 const REAL_BACKPACK = resolve(__dirname, 'real-wallets', 'backpack');
 const SCREENSHOT_DIR = resolve(__dirname, 'screenshots');
-const EXPECTED_VERSION = '0.4.4';
+const EXPECTED_VERSION = '0.4.5';
 
 const log = (...m) => process.stdout.write('[real] ' + m.join(' ') + '\n');
 

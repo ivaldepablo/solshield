@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.4';
+const SOLSHIELD_VERSION = '0.4.5';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script

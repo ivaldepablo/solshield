@@ -6,25 +6,42 @@
 import { inspectTx, inspectMessage, checkDomain } from '~lib/api-client';
 import type { BackgroundRequest, BackgroundResponse, VerdictView } from '~lib/messaging';
 
-// Simple in-memory cache with 5-minute TTL
+// Simple in-memory cache with 5-minute TTL.
+//
+// Keys are SHA-256 of the FULL payload, not a prefix. Earlier we used the
+// first 50 chars of base64(tx), but Solana txs start with the signature
+// length byte + 64-byte signature — those 50 chars are nearly identical
+// across many different transactions from the same wallet, causing
+// catastrophic cache collisions. A drainer could pre-poison the cache with
+// a benign tx whose prefix collides with an attack tx, then the attack tx
+// is served `safe` from cache.
 const cache = new Map<string, { verdict: VerdictView; expires: number }>();
 
-function cacheKey(req: BackgroundRequest): string {
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += bytes[i]!.toString(16).padStart(2, '0');
+  return s;
+}
+
+async function cacheKey(req: BackgroundRequest): Promise<string> {
   const { type, data } = req;
   if (type === 'inspect-tx' && data.tx) {
-    return `tx:${data.tx.slice(0, 50)}`; // Use tx prefix for cache busting
+    return `tx:${await sha256Hex(data.tx)}`;
   }
   if (type === 'inspect-message' && data.message) {
-    return `msg:${data.message}`;
+    return `msg:${await sha256Hex(data.message)}`;
   }
   if (type === 'check-domain' && data.url) {
-    return `domain:${data.url}`;
+    return `domain:${await sha256Hex(data.url)}`;
   }
   return '';
 }
 
-function getCached(req: BackgroundRequest): VerdictView | null {
-  const key = cacheKey(req);
+async function getCached(req: BackgroundRequest): Promise<VerdictView | null> {
+  const key = await cacheKey(req);
   if (!key) return null;
 
   const cached = cache.get(key);
@@ -32,13 +49,12 @@ function getCached(req: BackgroundRequest): VerdictView | null {
     return cached.verdict;
   }
 
-  // Expired, remove from cache
   if (cached) cache.delete(key);
   return null;
 }
 
-function setCached(req: BackgroundRequest, verdict: VerdictView): void {
-  const key = cacheKey(req);
+async function setCached(req: BackgroundRequest, verdict: VerdictView): Promise<void> {
+  const key = await cacheKey(req);
   if (key) {
     cache.set(key, { verdict, expires: Date.now() + 5 * 60 * 1000 }); // 5 min TTL
   }
@@ -56,8 +72,7 @@ async function trackStats(verdict: VerdictView): Promise<void> {
 async function handleRequest(
   req: BackgroundRequest
 ): Promise<BackgroundResponse> {
-  // Check cache first
-  const cached = getCached(req);
+  const cached = await getCached(req);
   if (cached) {
     return { verdict: cached };
   }
@@ -75,8 +90,7 @@ async function handleRequest(
       throw new Error('Invalid request: missing required fields');
     }
 
-    // Cache and track
-    setCached(req, verdict);
+    await setCached(req, verdict);
     await trackStats(verdict);
 
     return { verdict };

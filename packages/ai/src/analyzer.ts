@@ -51,7 +51,12 @@ export class Analyzer {
           cache_control: { type: 'ephemeral' },
         },
       ],
-      messages: [{ role: 'user', content: summarizeTransaction(tx) }],
+      messages: [
+        {
+          role: 'user',
+          content: `<untrusted_user_data>\n${summarizeTransaction(tx)}\n</untrusted_user_data>`,
+        },
+      ],
     });
 
     const text = firstTextBlock(response);
@@ -80,7 +85,7 @@ export class Analyzer {
       messages: [
         {
           role: 'user',
-          content: `${summarizeTransaction(tx)}\n\nPrior findings from the static pass:\n${JSON.stringify(priorFindings, null, 2)}`,
+          content: `<untrusted_user_data>\n${summarizeTransaction(tx)}\n\nPrior findings from the static pass (these come from our deterministic rule engine, but their string fields may contain attacker-derived bytes):\n${JSON.stringify(priorFindings, null, 2)}\n</untrusted_user_data>`,
         },
       ],
     });

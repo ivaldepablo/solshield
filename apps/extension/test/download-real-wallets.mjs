@@ -24,6 +24,13 @@ const WALLETS = [
   { name: 'phantom', id: 'bfnaelmomeimhlpmgjnjophhpkkoljpa' },
   { name: 'solflare', id: 'bhhhlbepdkbapadjdnnojkbgioiodbic' },
   { name: 'backpack', id: 'aflkmfhebedbjioipglgcbcmnbpgliof' },
+  // v0.4.4 multi-wallet coverage matrix:
+  { name: 'glow', id: 'ojbcfhjmpigfobfclfflafhblgemeidi' },
+  { name: 'trust', id: 'egjidjbpglichdcondbcbdnbeeppgdph' },
+  { name: 'coinbase', id: 'hnfanknocfeofbddgcijnmhnfnkdnaad' },
+  { name: 'mathwallet', id: 'afbcbjpbpfadlkmhmclhkeeodmamcflc' },
+  { name: 'coin98', id: 'aeachknmefphepccionboohckonoeemg' },
+  // Brave Wallet ships built-in with the Brave browser; there is no CWS CRX.
 ];
 
 const CRX_URL = (id) =>
@@ -71,7 +78,17 @@ function downloadOne(wallet) {
   const zipPath = resolve(OUT_DIR, wallet.name + '.zip');
   const extractDir = resolve(OUT_DIR, wallet.name);
 
+  // SKIP_EXISTING=1 (default) keeps already-extracted wallets; FORCE=1 redownloads.
+  const skipExisting = process.env.FORCE !== '1';
   if (existsSync(extractDir)) {
+    if (skipExisting && existsSync(resolve(extractDir, 'manifest.json'))) {
+      log(wallet.name, 'already extracted at', extractDir, '— skipping (FORCE=1 to redownload)');
+      const raw = readFileSync(resolve(extractDir, 'manifest.json'), 'utf8');
+      let manifest;
+      try { manifest = JSON.parse(raw); }
+      catch { manifest = { name: '?', version: '?' }; }
+      return { wallet: wallet.name, name: manifest.name, version: manifest.version, dir: extractDir, skipped: true };
+    }
     log(wallet.name, 'already extracted, removing for fresh download');
     rmSync(extractDir, { recursive: true, force: true });
   }
