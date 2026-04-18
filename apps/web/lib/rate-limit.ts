@@ -41,8 +41,8 @@ function getRedis(): Redis | null {
     lazyConnect: true,
     maxRetriesPerRequest: 1,
     enableOfflineQueue: false,
-    connectTimeout: 2000,
-    // don't spam reconnect attempts — we want fast failure so the route doesn't hang
+    connectTimeout: 1000,
+    commandTimeout: 1000,
     retryStrategy: () => null,
   };
 
@@ -77,9 +77,11 @@ export async function checkRateLimit(
 
   const key = `ratelimit:inspect:${identifier}:${bucket}`;
   try {
-    const count = await client.incr(key);
+    const count = await raceWithTimeout(client.incr(key), 1000);
     if (count === 1) {
-      await client.expire(key, windowSeconds);
+      void raceWithTimeout(client.expire(key, windowSeconds), 1000).catch(() => {
+        // best-effort — if expire times out the bucket key just lingers a bit
+      });
     }
     const remaining = Math.max(0, max - count);
     return {
@@ -95,6 +97,22 @@ export async function checkRateLimit(
     }
     return { allowed: true, remaining: Infinity, resetAt: now, limit: max };
   }
+}
+
+function raceWithTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`redis op timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
 }
 
 export function rateLimitHeaders(rl: RateLimitResult): Record<string, string> {

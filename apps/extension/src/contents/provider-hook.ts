@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.1';
+const SOLSHIELD_VERSION = '0.4.2';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
@@ -1251,9 +1251,10 @@ async function getVerdict(
   }
 }
 
-/** Show overlay via overlay-mount in ISOLATED world. Wait for user's click
- *  back via postMessage. Returns 'proceed' or 'reject'. Defaults to reject
- *  on timeout (safer for non-safe verdicts). */
+/** Show overlay via overlay-mount in ISOLATED world. v0.4.2: decision arrives
+ *  on a transferred MessagePort, not a public postMessage — a malicious dapp
+ *  cannot forge `{decision: 'proceed'}` because it has no reference to port1.
+ *  Defaults to reject on timeout (safer for non-safe verdicts). */
 async function askUserViaOverlay(
   verdictData: { verdict: 'safe' | 'suspicious' | 'danger'; summary?: string },
   kind: 'msg' | 'tx',
@@ -1261,24 +1262,29 @@ async function askUserViaOverlay(
   const requestId = newId();
   logEvent('info', 'overlay-ask', `${requestId.slice(-6)}`);
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      logEvent('warn', 'overlay-ask', `${requestId.slice(-6)} timeout → reject`);
-      window.removeEventListener('message', listener);
-      resolve('reject');
+    const channel = new MessageChannel();
+    let settled = false;
+    const settle = (decision: 'proceed' | 'reject', why: string): void => {
+      if (settled) return;
+      settled = true;
+      NATIVE.clearTimeout(timer);
+      try { channel.port1.onmessage = null; } catch { /* ignore */ }
+      try { channel.port1.close(); } catch { /* ignore */ }
+      logEvent('info', 'overlay-ask', `${requestId.slice(-6)} → ${decision} (${why})`);
+      resolve(decision);
+    };
+
+    const timer = NATIVE.setTimeout(() => {
+      settle('reject', 'timeout');
     }, 60_000);
 
-    const listener = (event: MessageEvent): void => {
-      if (event.source !== window) return;
-      const data = event.data as { id?: string; decision?: 'proceed' | 'reject' } | undefined;
-      if (!data || data.id !== requestId || !data.decision) return;
-      clearTimeout(timer);
-      window.removeEventListener('message', listener);
-      logEvent('info', 'overlay-ask', `${requestId.slice(-6)} → ${data.decision}`);
-      resolve(data.decision);
+    channel.port1.onmessage = (e: MessageEvent): void => {
+      const d = (e.data ?? {}) as { decision?: 'proceed' | 'reject' };
+      settle(d.decision === 'proceed' ? 'proceed' : 'reject', 'port-msg');
     };
-    window.addEventListener('message', listener);
+    try { channel.port1.start(); } catch { /* ignore */ }
 
-    window.postMessage(
+    NATIVE.postMessage(
       {
         __solshield_show_overlay: true,
         id: requestId,
@@ -1286,6 +1292,7 @@ async function askUserViaOverlay(
         kind,
       },
       '*',
+      [channel.port2],
     );
   });
 }

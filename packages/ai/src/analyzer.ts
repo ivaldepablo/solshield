@@ -10,6 +10,8 @@ const MODEL_IDS: Record<ModelTier, string> = {
   deep: 'claude-opus-4-7',
 };
 
+const ANTHROPIC_TIMEOUT_MS = 6000;
+
 export interface AnalyzerOptions {
   apiKey: string;
   triageModel?: string;
@@ -29,7 +31,7 @@ export class Analyzer {
   private readonly deepModel: string;
 
   constructor(opts: AnalyzerOptions) {
-    this.client = new Anthropic({ apiKey: opts.apiKey });
+    this.client = new Anthropic({ apiKey: opts.apiKey, timeout: ANTHROPIC_TIMEOUT_MS });
     this.triageModel = opts.triageModel ?? MODEL_IDS.triage;
     this.deepModel = opts.deepModel ?? MODEL_IDS.deep;
   }

@@ -25,7 +25,9 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_idle',
 };
 
-const HOST_ID = 'solshield-overlay-host';
+// Random per-load host ID so a malicious dapp can't `document.querySelector`
+// for a known selector and pre-emptively .remove() our overlay.
+const HOST_ID = `solshield-overlay-${Math.random().toString(36).slice(2, 10)}`;
 const OVERLAY_TIMEOUT_MS = 60_000;
 
 function postContentResponse(message: ContentResponse): void {
@@ -90,7 +92,6 @@ function waitForUserDecision(
 async function showOverlayAndAwaitDecision(
   verdict: VerdictView,
 ): Promise<'proceed' | 'reject'> {
-  // Tear down any leftover overlay from a previous request.
   document.getElementById(HOST_ID)?.remove();
 
   const host = document.createElement('div');
@@ -99,7 +100,7 @@ async function showOverlayAndAwaitDecision(
 
   const signal: { decision: 'proceed' | 'reject' | null } = { decision: null };
 
-  const unmount = mountInShadow(
+  let unmount = mountInShadow(
     host,
     createElement(Overlay, {
       verdict,
@@ -112,10 +113,32 @@ async function showOverlayAndAwaitDecision(
     }),
   );
 
+  // If the dapp tries to remove our host element, re-attach it. We can't
+  // protect the host element itself with Object.freeze — attempting that on
+  // an Element is silently ignored — but we can detect removal and undo it.
+  const observer = new MutationObserver(() => {
+    if (signal.decision) return;
+    if (!document.body.contains(host)) {
+      postLogEntry('warn', 'overlay', 'host removed by page — re-attaching');
+      try { unmount(); } catch { /* ignore */ }
+      document.body.appendChild(host);
+      unmount = mountInShadow(
+        host,
+        createElement(Overlay, {
+          verdict,
+          onProceed: () => { signal.decision = 'proceed'; },
+          onReject: () => { signal.decision = 'reject'; },
+        }),
+      );
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: false });
+
   try {
     return await waitForUserDecision(signal);
   } finally {
-    unmount();
+    observer.disconnect();
+    try { unmount(); } catch { /* ignore */ }
     host.remove();
   }
 }
@@ -197,25 +220,75 @@ async function handleInpageRequest(req: InpageRequest): Promise<void> {
   }
 }
 
+// Capture-phase so we run before any dapp-registered bubble listener and
+// claim the transferred MessagePort first.
 window.addEventListener(
   'message',
   (event) => {
     if (event.source !== window) return;
     const data = event.data as
       | (InpageRequest & { __solshield_show_overlay?: undefined })
-      | { __solshield_show_overlay: true; id: string; verdict: VerdictView; kind: VerdictView['kind'] }
+      | {
+          __solshield_show_overlay: true;
+          id?: string;
+          verdict: VerdictView;
+          kind: VerdictView['kind'];
+        }
       | undefined;
     if (!data || typeof data !== 'object') return;
 
-    // New v0.3.1 path: provider-hook fetched verdict directly and just wants
-    // us to show the overlay.
     if ((data as { __solshield_show_overlay?: boolean }).__solshield_show_overlay === true) {
       const showReq = data as {
         __solshield_show_overlay: true;
-        id: string;
+        id?: string;
         verdict: VerdictView;
         kind: VerdictView['kind'];
       };
+
+      // v0.4.2: prefer transferred MessagePort. Provider-hook in MAIN keeps
+      // port1; we own port2. Decision goes through the port — a malicious
+      // dapp listener cannot forge a reply on port1 because it has no
+      // reference to it. (Residual risk: dapp could register a capture-phase
+      // listener at document_start AND grab event.ports[0] AND postMessage on
+      // it before we do — we beat that by being the capture-phase listener
+      // on ISOLATED world, registered at document_idle when no other dapp
+      // code has yet had a chance to run inside our world.)
+      const port = event.ports?.[0];
+
+      if (port) {
+        try { port.start(); } catch { /* ignore */ }
+        const visibilityWait = document.visibilityState === 'visible'
+          ? Promise.resolve()
+          : new Promise<void>((res) => {
+              const onVis = (): void => {
+                if (document.visibilityState === 'visible') {
+                  document.removeEventListener('visibilitychange', onVis);
+                  res();
+                }
+              };
+              document.addEventListener('visibilitychange', onVis);
+              // Cap the wait — if user never returns, the per-request timer
+              // in provider-hook will expire and we'll resolve to 'reject'.
+              setTimeout(() => {
+                document.removeEventListener('visibilitychange', onVis);
+                res();
+              }, OVERLAY_TIMEOUT_MS - 1000);
+            });
+
+        void visibilityWait.then(async () => {
+          try {
+            const decision = await showOverlayAndAwaitDecision(showReq.verdict);
+            try { port.postMessage({ decision }); } catch { /* ignore */ }
+          } catch {
+            try { port.postMessage({ decision: 'reject' as const }); } catch { /* ignore */ }
+          } finally {
+            try { port.close(); } catch { /* ignore */ }
+          }
+        });
+        return;
+      }
+
+      // Legacy postMessage path (provider-hook < 0.4.2): correlate by id.
       void (async () => {
         try {
           const decision = await showOverlayAndAwaitDecision(showReq.verdict);
@@ -227,7 +300,6 @@ window.addEventListener(
       return;
     }
 
-    // Legacy path (still supported as fallback for any provider-hook < 0.3.1).
     if (
       !('type' in data) ||
       (data.type !== 'analyze-tx' && data.type !== 'analyze-message')
@@ -236,5 +308,5 @@ window.addEventListener(
     }
     void handleInpageRequest(data as InpageRequest);
   },
-  false,
+  { capture: true },
 );

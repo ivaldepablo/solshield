@@ -10,19 +10,18 @@ export function mountInShadow(
   host: HTMLElement,
   element: React.ReactElement
 ): () => void {
-  // Attach shadow root in open mode for inspector access
-  const shadow = host.attachShadow({ mode: 'open' });
+  // closed mode: dapp page scripts cannot read host.shadowRoot to inspect or
+  // tamper with overlay DOM. Lost inspector access is acceptable — we ship
+  // /diagnostic for our own debugging.
+  const shadow = host.attachShadow({ mode: 'closed' });
 
-  // Create a div to mount React into
   const container = document.createElement('div');
   container.id = 'solshield-root';
   shadow.appendChild(container);
 
-  // Render React component
   const root = createRoot(container);
   root.render(element);
 
-  // Return unmount function
   return () => {
     root.unmount();
     container.remove();
