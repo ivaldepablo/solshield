@@ -16,6 +16,7 @@ import type { PlasmoCSConfig } from 'plasmo';
 import { createElement } from 'react';
 import { Overlay } from '../components/Overlay';
 import { mountInShadow } from '../lib/shadow-dom';
+import { inspectTx, inspectMessage } from '../lib/api-client';
 import type { ContentResponse, InpageRequest, VerdictView } from '../lib/messaging';
 
 export const config: PlasmoCSConfig = {
@@ -26,12 +27,6 @@ export const config: PlasmoCSConfig = {
 
 const HOST_ID = 'solshield-overlay-host';
 const OVERLAY_TIMEOUT_MS = 60_000;
-
-interface BackgroundResponse {
-  verdict?: VerdictView;
-  error?: string;
-  failOpen?: boolean;
-}
 
 function postContentResponse(message: ContentResponse): void {
   // postMessage to self — the page's MAIN world will see it via its own
@@ -129,27 +124,36 @@ async function handleInpageRequest(req: InpageRequest): Promise<void> {
   const kind = inferKind(req.type);
   const t0 = performance.now();
   postLogEntry('info', 'recv', `${req.type} id=${req.id.slice(-6)}`);
-  try {
-    const bgRequest =
-      req.type === 'analyze-tx'
-        ? { type: 'inspect-tx' as const, data: { tx: req.data.tx } }
-        : { type: 'inspect-message' as const, data: { message: req.data.message } };
 
-    let response: BackgroundResponse | undefined;
+  try {
+    // Call API DIRECTLY from this ISOLATED-world content script. We used to
+    // proxy through background.ts via chrome.runtime.sendMessage, but on real
+    // dapps under heavy react traffic the message to the service worker
+    // sometimes never resolved (SW killed mid-request, or some other extension
+    // interfering). Doing fetch here:
+    //   - avoids any chrome.runtime.sendMessage round-trip
+    //   - bypasses the dapp's CSP (ISOLATED-world has host_permissions)
+    //   - keeps the request alive even if the SW dies
+    let verdict: VerdictView;
     try {
-      response = (await chrome.runtime.sendMessage(bgRequest)) as BackgroundResponse | undefined;
+      verdict =
+        req.type === 'analyze-tx'
+          ? await inspectTx(req.data.tx ?? '')
+          : await inspectMessage(req.data.message ?? '');
       postLogEntry(
         'info',
-        'bg-resp',
-        `${Math.round(performance.now() - t0)}ms verdict=${!!response?.verdict} err=${response?.error || 'none'}`,
+        'api-resp',
+        `${Math.round(performance.now() - t0)}ms verdict=${verdict.verdict}`,
       );
     } catch (err) {
-      postLogEntry('err', 'bg-throw', err instanceof Error ? err.message : String(err));
-      throw err;
-    }
-
-    // Background unreachable or returned no verdict → fail open.
-    if (!response || (!response.verdict && response.failOpen !== false)) {
+      // API failed (timeout, network, server error) → fail open so the dapp
+      // doesn't break. User loses our protection on this one call but their
+      // wallet flow continues.
+      postLogEntry(
+        'warn',
+        'api-fail',
+        `${Math.round(performance.now() - t0)}ms err=${err instanceof Error ? err.message : String(err)}`,
+      );
       postContentResponse({
         id: req.id,
         verdict: failOpenVerdict(kind),
@@ -158,39 +162,33 @@ async function handleInpageRequest(req: InpageRequest): Promise<void> {
       return;
     }
 
-    if (!response.verdict) {
-      postContentResponse({
-        id: req.id,
-        error: response.error ?? 'unknown background error',
-      });
-      return;
-    }
-
     // Safe → forward verdict immediately, no UI.
-    if (response.verdict.verdict === 'safe') {
-      postContentResponse({ id: req.id, verdict: response.verdict });
+    if (verdict.verdict === 'safe') {
+      postContentResponse({ id: req.id, verdict });
       return;
     }
 
     // Dangerous / suspicious → show overlay and wait for the user.
+    postLogEntry('info', 'overlay', `showing for verdict=${verdict.verdict}`);
     try {
-      const decision = await showOverlayAndAwaitDecision(response.verdict);
+      const decision = await showOverlayAndAwaitDecision(verdict);
+      postLogEntry('info', 'overlay', `user decision=${decision}`);
       if (decision === 'reject') {
-        postContentResponse({
-          id: req.id,
-          error: 'User rejected the request.',
-        });
+        postContentResponse({ id: req.id, error: 'User rejected the request.' });
       } else {
-        postContentResponse({ id: req.id, verdict: response.verdict });
+        postContentResponse({ id: req.id, verdict });
       }
-    } catch {
-      // Timeout → treat as rejection (safer default for hostile-looking txs).
-      postContentResponse({
-        id: req.id,
-        error: 'User rejected the request.',
-      });
+    } catch (err) {
+      postLogEntry(
+        'warn',
+        'overlay',
+        `timed out / threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Treat as rejection (safer default for hostile-looking txs).
+      postContentResponse({ id: req.id, error: 'User rejected the request.' });
     }
   } catch (err) {
+    postLogEntry('err', 'handler', err instanceof Error ? err.message : String(err));
     postContentResponse({
       id: req.id,
       error: err instanceof Error ? err.message : 'unknown error',

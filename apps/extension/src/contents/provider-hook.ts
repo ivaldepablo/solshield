@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.2.2';
+const SOLSHIELD_VERSION = '0.3.0';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
