@@ -39,6 +39,19 @@ function postContentResponse(message: ContentResponse): void {
   window.postMessage(message, '*');
 }
 
+/** Send a log entry to MAIN world's __solshield.log via postMessage.
+ *  Lets us see overlay-mount's internal events on /diagnostic. */
+function postLogEntry(level: 'info' | 'warn' | 'err', tag: string, msg: string): void {
+  try {
+    window.postMessage(
+      { __solshield_log: true, level, tag: 'om/' + tag, msg },
+      '*',
+    );
+  } catch {
+    // ignore
+  }
+}
+
 /** Build a synthetic safe verdict used when fail-open kicks in. */
 function failOpenVerdict(kind: VerdictView['kind']): VerdictView {
   return {
@@ -114,15 +127,26 @@ async function showOverlayAndAwaitDecision(
 
 async function handleInpageRequest(req: InpageRequest): Promise<void> {
   const kind = inferKind(req.type);
+  const t0 = performance.now();
+  postLogEntry('info', 'recv', `${req.type} id=${req.id.slice(-6)}`);
   try {
     const bgRequest =
       req.type === 'analyze-tx'
         ? { type: 'inspect-tx' as const, data: { tx: req.data.tx } }
         : { type: 'inspect-message' as const, data: { message: req.data.message } };
 
-    const response = (await chrome.runtime.sendMessage(bgRequest)) as
-      | BackgroundResponse
-      | undefined;
+    let response: BackgroundResponse | undefined;
+    try {
+      response = (await chrome.runtime.sendMessage(bgRequest)) as BackgroundResponse | undefined;
+      postLogEntry(
+        'info',
+        'bg-resp',
+        `${Math.round(performance.now() - t0)}ms verdict=${!!response?.verdict} err=${response?.error || 'none'}`,
+      );
+    } catch (err) {
+      postLogEntry('err', 'bg-throw', err instanceof Error ? err.message : String(err));
+      throw err;
+    }
 
     // Background unreachable or returned no verdict → fail open.
     if (!response || (!response.verdict && response.failOpen !== false)) {

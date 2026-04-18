@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.2.1';
+const SOLSHIELD_VERSION = '0.2.2';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
@@ -195,11 +195,19 @@ window.addEventListener(
     if (event.source !== window) return;
 
     const data = event.data as ContentResponse | undefined;
-    if (!data || typeof data !== 'object' || !('id' in data)) return;
+    if (!data || typeof data !== 'object') return;
 
+    // overlay-mount log forwarding: bridges its events into __solshield.log
+    // so /diagnostic shows the full pipeline.
+    if ((data as unknown as Record<string, unknown>).__solshield_log === true) {
+      const d = data as unknown as { level: 'info' | 'warn' | 'err'; tag: string; msg: string };
+      logEvent(d.level, d.tag, d.msg);
+      return;
+    }
+
+    if (!('id' in data)) return;
     // Skip our own outgoing requests — they have a `type` field, responses don't.
     if ('type' in (data as unknown as Record<string, unknown>)) return;
-
     // Must be a response from overlay-mount — has verdict or error.
     if (!('verdict' in data) && !('error' in data)) return;
 
