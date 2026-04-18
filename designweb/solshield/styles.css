@@ -304,7 +304,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 
 .hero {
   position: relative;
-  padding: clamp(20px, 3vw, 36px) 0 clamp(16px, 2.5vw, 28px);
+  padding: clamp(32px, 5vw, 56px) 0 clamp(28px, 4vw, 44px);
 }
 .hero-grid {
   display: grid;
@@ -317,14 +317,14 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 .hero-eyebrow {
   display: inline-flex; align-items: center; gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 22px;
 }
 .hero-title {
   font-size: clamp(32px, 4.8vw, 58px);
   line-height: 1.02;
   letter-spacing: -0.03em;
   font-weight: 700;
-  margin: 0 0 14px;
+  margin: 0 0 18px;
   text-wrap: balance;
 }
 .hero-title .hi { color: var(--ok); }
@@ -346,13 +346,13 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
   font-size: clamp(15px, 1.4vw, 17px);
   color: var(--fg-1);
   max-width: 48ch;
-  margin: 0 0 18px;
-  line-height: 1.5;
+  margin: 0 0 26px;
+  line-height: 1.55;
   text-wrap: pretty;
 }
 .hero-cta {
   display: flex; flex-wrap: wrap; gap: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 24px;
 }
 .hero-meta {
   display: flex; flex-wrap: wrap; gap: 20px 32px;
@@ -440,20 +440,20 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
    ========================================================================== */
 
 .section {
-  padding: clamp(14px, 2vw, 22px) 0;
+  padding: clamp(32px, 4vw, 52px) 0;
   position: relative;
 }
 .section-head {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 14px;
+  gap: 24px;
+  margin-bottom: 28px;
   flex-wrap: wrap;
 }
 .section-head h2 {
   margin: 0;
-  font-size: clamp(22px, 2.6vw, 30px);
+  font-size: clamp(24px, 2.8vw, 32px);
   letter-spacing: -0.02em;
   font-weight: 600;
   max-width: 28ch;
@@ -464,7 +464,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
   color: var(--fg-2);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  margin-bottom: 6px;
+  margin-bottom: 10px;
   display: flex; align-items: center; gap: 10px;
 }
 .section-head .kicker::before {
@@ -494,7 +494,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 }
 @media (max-width: 800px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 .stat {
-  padding: 16px 20px;
+  padding: 22px 24px;
   border-right: 1px solid var(--br-1);
 }
 .stat:last-child { border-right: 0; }
@@ -759,19 +759,19 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 @media (max-width: 600px) { .features-grid { grid-template-columns: 1fr; } }
 .feat {
   background: var(--bg-1);
-  padding: 18px 18px 20px;
+  padding: 22px 22px 24px;
   position: relative;
   transition: background 0.15s;
 }
 .feat:hover { background: var(--bg-2); }
 .feat-icon {
-  width: 32px; height: 32px;
+  width: 34px; height: 34px;
   display: grid; place-items: center;
   border: 1px solid var(--br-2);
   background: var(--bg-0);
   border-radius: 4px;
   color: var(--ok);
-  margin-bottom: 12px;
+  margin-bottom: 14px;
   font-family: var(--mono);
   font-weight: 700;
   font-size: 13px;
@@ -922,7 +922,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
     var(--bg-1);
   border: 1px solid var(--br-1);
   border-radius: var(--radius-lg);
-  padding: 28px;
+  padding: 34px;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 32px;
