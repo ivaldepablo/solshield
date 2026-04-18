@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.4.8';
+const SOLSHIELD_VERSION = '0.4.10';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 // CRITICAL: stash native APIs at module load, BEFORE any user/dapp script
@@ -695,15 +695,47 @@ function createProxyFn(
         return original.apply(this, args);
       }
     } catch (err) {
-      // Handle timeout or offline errors
+      // v0.4.9.1: fail-CLOSED on Verdict timeout / offline. Earlier we
+      // called `original.apply(...)` here which silently passed the request
+      // straight to the wallet — that's how Phantom popups were appearing
+      // without our overlay on parallel signMessage exploits (Magic Eden's
+      // Dynamic SDK fires 2 calls; one wins our verdict, the second times
+      // out at the 15s waitForVerdict round-trip and the OLD fail-open path
+      // bypassed everything). Now we surface the failure to the user via a
+      // synthetic SUSPICIOUS overlay + Layer 4 popup, and DEFAULT TO REJECT
+      // (throw user-rejection error) instead of letting the wallet sign.
       if (
         err instanceof Error &&
         (err.message.includes('Verdict timeout') ||
           err.message.includes('offline'))
       ) {
-        console.warn('[SolShield] offline, failed open');
         recordInterception(type === 'signMessage' ? 'msg' : 'tx', 'failed-open');
-        logEvent('warn', 'fail-open', `legacy ${type}: ${err.message}`);
+        logEvent(
+          'warn',
+          'fail-CLOSED',
+          `legacy ${type}: ${err.message} → showing synthetic suspicious overlay (no longer silently passing through)`,
+        );
+        const verdictKind: 'msg' | 'tx' = type === 'signMessage' ? 'msg' : 'tx';
+        try {
+          const decision = await askUserViaOverlay(
+            {
+              verdict: 'suspicious',
+              summary:
+                'SolShield could not analyze this signature in time (network/timeout). The payload was NOT verified — proceed only if you trust the dapp + wallet message exactly.',
+            },
+            verdictKind,
+          );
+          if (decision === 'reject') throw createRejectionError();
+        } catch (overlayErr) {
+          if (overlayErr instanceof Error && overlayErr.message === 'User rejected the request.') {
+            throw overlayErr;
+          }
+          // Overlay also failed — DEFAULT TO REJECT, not pass through.
+          // A failure in our UI is a bigger red flag than the original
+          // backend timeout.
+          logEvent('err', 'fail-CLOSED', `overlay also failed (${overlayErr instanceof Error ? overlayErr.message : 'unknown'}) — rejecting`);
+          throw createRejectionError();
+        }
         return original.apply(this, args);
       }
       throw err;
@@ -1167,16 +1199,38 @@ function wrapWalletStandardMethod(
       }
       return orig.apply(this, inputs);
     } catch (err) {
+      // v0.4.9.1: fail-CLOSED on timeout/offline (was silently passing
+      // through to the wallet — that's the parallel-signMessage bypass).
       if (
         err instanceof Error &&
         (err.message.includes('Verdict timeout') || err.message.includes('offline'))
       ) {
-        console.warn('[SolShield] wallet-standard offline, failed open');
         recordInterception(
           intent === 'tx' ? 'wallet-standard-tx' : 'wallet-standard-msg',
           'failed-open',
         );
-        logEvent('warn', 'fail-open', `polled ws-${methodName}: ${err.message}`);
+        logEvent(
+          'warn',
+          'fail-CLOSED',
+          `ws-${methodName}: ${err.message} → showing synthetic suspicious overlay`,
+        );
+        try {
+          const decision = await askUserViaOverlay(
+            {
+              verdict: 'suspicious',
+              summary:
+                'SolShield could not analyze this signature in time. The payload was NOT verified — proceed only if you trust the dapp + the wallet message exactly.',
+            },
+            intent,
+          );
+          if (decision === 'reject') throw createRejectionError();
+        } catch (overlayErr) {
+          if (overlayErr instanceof Error && overlayErr.message === 'User rejected the request.') {
+            throw overlayErr;
+          }
+          logEvent('err', 'fail-CLOSED', `ws overlay also failed → rejecting`);
+          throw createRejectionError();
+        }
         return orig.apply(this, inputs);
       }
       throw err;
@@ -1688,66 +1742,110 @@ function wrapSigningInvocation(
   return wrapper;
 }
 
+/** v0.4.9 dedupe: Magic Eden's Dynamic SDK and several other dapps fire
+ *  signMessage 2-5 times in parallel for the same payload. Each call would
+ *  hit getVerdict separately, which (a) burns rate-limit, (b) makes some
+ *  calls timeout under load, (c) those timeouts fail-open and call the wallet
+ *  directly — exactly the bypass we observed live on magiceden.io.
+ *
+ *  We dedupe by (endpoint + JSON body). All concurrent callers receive the
+ *  SAME promise. After 30s the entry is GC'd so a second tx with the same
+ *  payload still gets a fresh fetch. */
+const _inflightVerdicts = new Map<
+  string,
+  { promise: Promise<{ verdict: 'safe' | 'suspicious' | 'danger'; summary?: string } | null>; ts: number }
+>();
+function _gcVerdicts(): void {
+  const now = Date.now();
+  for (const [k, v] of _inflightVerdicts) {
+    if (now - v.ts > 30_000) _inflightVerdicts.delete(k);
+  }
+}
+
 /** Direct fetch to the SolShield API from MAIN world.
  *
- *  Three outcomes:
- *    - server returned a verdict → return it.
- *    - server returned 429/5xx (rate-limit or server error) → return a
- *      SYNTHETIC suspicious verdict so the overlay still mounts and the user
- *      decides. Earlier we returned null on these and the caller fail-opened
- *      silently — that meant Phantom popup appeared without our overlay
- *      whenever the API was overloaded. v0.4.8 fail-CLOSED on these.
- *    - true offline (network error / timeout) → return null. Caller may
- *      fail-open since the failure is on the user's side.
+ *  v0.4.9: ALL upstream errors (429, 5xx, AND timeout/network) now return a
+ *  SYNTHETIC SUSPICIOUS verdict instead of null, because v0.4.8 still let
+ *  timeouts fail-open silently — Magic Eden parallel signMessage exploited
+ *  that to call Phantom directly without our overlay. Returning null was
+ *  the original sin: "null = fail-open" buried the bypass in the catch
+ *  branch. There's NO scenario where fail-open is the right answer for a
+ *  signature flow we've intercepted: if the user's offline they shouldn't
+ *  be able to sign anyway, and if our backend is down a "verify manually"
+ *  prompt is strictly better than a silent pass-through.
  *
- *  Timeout 12s (was 8s) — leaves headroom for cold-start on the first call. */
+ *  Timeout: 12s. */
 async function getVerdict(
   endpoint: 'inspect-message' | 'inspect',
   body: Record<string, unknown>,
 ): Promise<{ verdict: 'safe' | 'suspicious' | 'danger'; summary?: string } | null> {
-  const url = `https://solshield.dev/api/${endpoint}`;
-  logEvent('info', 'verdict-fetch', `→ ${endpoint}`);
-  try {
-    const ctrl = new NATIVE.AbortController();
-    const timer = NATIVE.setTimeout(() => ctrl.abort(), 12_000);
-    const res = await NATIVE.fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: NATIVE.jsonStringify(body),
-      signal: ctrl.signal,
-    });
-    NATIVE.clearTimeout(timer);
-    if (res.status === 429) {
-      logEvent('warn', 'verdict-fetch', 'HTTP 429 → synthetic suspicious (fail-CLOSED on rate limit)');
-      return {
-        verdict: 'suspicious',
-        summary:
-          'SolShield rate-limited; could not analyze this signature. Verify the message in your wallet popup before signing.',
-      };
-    }
-    if (res.status >= 500 && res.status < 600) {
-      logEvent('warn', 'verdict-fetch', `HTTP ${res.status} → synthetic suspicious (fail-CLOSED on server error)`);
-      return {
-        verdict: 'suspicious',
-        summary:
-          'SolShield backend error; could not analyze this signature. Verify the message in your wallet popup before signing.',
-      };
-    }
-    if (!res.ok) {
-      logEvent('warn', 'verdict-fetch', `HTTP ${res.status}`);
-      return null;
-    }
-    const text = await res.text();
-    const data = NATIVE.jsonParse(text) as {
-      verdict: 'safe' | 'suspicious' | 'danger';
-      summary?: string;
-    };
-    logEvent('info', 'verdict-fetch', `← ${data.verdict}`);
-    return data;
-  } catch (err) {
-    logEvent('warn', 'verdict-fetch', `fail: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+  _gcVerdicts();
+  const dedupeKey = endpoint + ':' + NATIVE.jsonStringify(body);
+  const cached = _inflightVerdicts.get(dedupeKey);
+  if (cached) {
+    logEvent('info', 'verdict-fetch', `${endpoint} dedupe hit (parallel call)`);
+    return cached.promise;
   }
+  const promise = (async (): Promise<{ verdict: 'safe' | 'suspicious' | 'danger'; summary?: string } | null> => {
+    const url = `https://solshield.dev/api/${endpoint}`;
+    logEvent('info', 'verdict-fetch', `→ ${endpoint}`);
+    try {
+      const ctrl = new NATIVE.AbortController();
+      const timer = NATIVE.setTimeout(() => ctrl.abort(), 12_000);
+      const res = await NATIVE.fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: NATIVE.jsonStringify(body),
+        signal: ctrl.signal,
+      });
+      NATIVE.clearTimeout(timer);
+      if (res.status === 429) {
+        logEvent('warn', 'verdict-fetch', 'HTTP 429 → synthetic suspicious (fail-CLOSED)');
+        return {
+          verdict: 'suspicious',
+          summary:
+            'SolShield rate-limited; could not analyze this signature. Verify the message in your wallet popup before signing.',
+        };
+      }
+      if (res.status >= 500 && res.status < 600) {
+        logEvent('warn', 'verdict-fetch', `HTTP ${res.status} → synthetic suspicious (fail-CLOSED)`);
+        return {
+          verdict: 'suspicious',
+          summary:
+            'SolShield backend error; could not analyze this signature. Verify the message in your wallet popup before signing.',
+        };
+      }
+      if (!res.ok) {
+        logEvent('warn', 'verdict-fetch', `HTTP ${res.status} → synthetic suspicious (fail-CLOSED)`);
+        return {
+          verdict: 'suspicious',
+          summary:
+            `SolShield got HTTP ${res.status}; could not analyze this signature. Verify the message in your wallet popup before signing.`,
+        };
+      }
+      const text = await res.text();
+      const data = NATIVE.jsonParse(text) as {
+        verdict: 'safe' | 'suspicious' | 'danger';
+        summary?: string;
+      };
+      logEvent('info', 'verdict-fetch', `← ${data.verdict}`);
+      return data;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logEvent('warn', 'verdict-fetch', `fail: ${msg} → synthetic suspicious (fail-CLOSED)`);
+      // v0.4.9: timeout / network / abort all fail-CLOSED with a synthetic
+      // suspicious. Earlier returning null caused the wrapper to call the
+      // original wallet method silently — that's how Phantom popups were
+      // appearing without our overlay on parallel signMessage exploits.
+      return {
+        verdict: 'suspicious',
+        summary:
+          'SolShield could not reach its backend (timeout/network). The signature was not verified — confirm carefully in your wallet popup, or reject if anything looks off.',
+      };
+    }
+  })();
+  _inflightVerdicts.set(dedupeKey, { promise, ts: Date.now() });
+  return promise;
 }
 
 /** Map of pending overlay decisions, keyed by per-request crypto-random

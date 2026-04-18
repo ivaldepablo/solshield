@@ -91,12 +91,41 @@ function fireSystemNotification(verdict: VerdictView): void {
     chrome.runtime.sendMessage(
       { type: 'show-system-notification', verdict, hostname },
       () => {
-        // chrome.runtime.lastError can fire if the SW is asleep / no listener.
-        // Either way we don't care — it's a best-effort side channel.
         const _err = chrome.runtime.lastError;
-        if (_err) {
-          // ignore
-        }
+        if (_err) { /* ignore */ }
+      },
+    );
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Layer 4 — popup window. Asks the background SW to spawn a separate Chrome
+ * window with our warning. Lives outside the dapp page DOM (Magic Eden's
+ * own "Sign" modal can hide our in-page overlay), and outside the tab
+ * compositor (Phantom's notification.html steals tab focus). It's a real
+ * browser window the user can't miss.
+ *
+ * Pure information — the actual REJECT/PROCEED decision still happens via
+ * the in-page overlay so the wallet wrapper resolves correctly. The popup
+ * has a "GO BACK TO DAPP TAB" CTA that focuses the originating tab.
+ */
+function fireWarningPopup(verdict: VerdictView): void {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+    if (verdict.verdict === 'safe') return;
+    let hostname = '';
+    try {
+      hostname = location.hostname || location.host || 'this site';
+    } catch {
+      hostname = 'this site';
+    }
+    chrome.runtime.sendMessage(
+      { type: 'show-warning-popup', verdict, hostname },
+      () => {
+        const _err = chrome.runtime.lastError;
+        if (_err) { /* ignore */ }
       },
     );
   } catch {
@@ -228,10 +257,12 @@ async function showOverlayAndAwaitDecision(
 ): Promise<'proceed' | 'reject'> {
   document.getElementById(HOST_ID)?.remove();
 
-  // Layer 1 fires in PARALLEL with the overlay mount — the user may be
-  // about to alt-tab to Phantom's notification.html, so we want the OS toast
-  // up immediately, not after they decide.
+  // Layer 1 + Layer 4 fire in PARALLEL with the overlay mount — the user
+  // may be about to alt-tab to Phantom's notification.html, so we want the
+  // OS toast (Layer 1) AND the standalone Chrome popup window (Layer 4) up
+  // immediately, not after they decide.
   fireSystemNotification(verdict);
+  fireWarningPopup(verdict);
 
   const host = document.createElement('div');
   host.id = HOST_ID;

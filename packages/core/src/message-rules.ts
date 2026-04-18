@@ -1,5 +1,21 @@
 import type { Finding, Verdict } from './types';
 import type { MessageRule, SignMessageInspection } from './message-types';
+import legitDappsData from './data/legit-dapps.json';
+
+const LEGIT_DAPPS_SET: ReadonlySet<string> = new Set(
+  (legitDappsData as string[]).map((d) => d.toLowerCase()),
+);
+
+/** True iff `host` matches a legit-dapp entry (exact match or subdomain). */
+function isLegitHost(host: string | null): boolean {
+  if (!host) return false;
+  const h = host.toLowerCase();
+  if (LEGIT_DAPPS_SET.has(h)) return true;
+  for (const legit of LEGIT_DAPPS_SET) {
+    if (h.endsWith('.' + legit)) return true;
+  }
+  return false;
+}
 
 // -------- severity weights (same as rules.ts) --------
 
@@ -127,15 +143,40 @@ export const urlInMessage: MessageRule = {
   evaluate(msg) {
     if (!msg.decodedText) return [];
     if (!URL_RE.test(msg.decodedText)) return [];
-    // collect all URLs for context
     const urls = msg.decodedText.match(/\bhttps?:\/\/[^\s"'<>]+/gi) ?? [];
+    if (urls.length === 0) return [];
+
+    // Resolve which URLs are legitimate vs cross-domain. A URL is "safe" if:
+    //   1. its host matches the requesting origin's host (same-origin link), OR
+    //   2. its host (or root domain) is in our legit-dapps allowlist.
+    // Only CROSS-DOMAIN URLs that don't match the origin AND aren't legit
+    // dapps trigger the warning. Magic Eden's own SIWS message links to
+    // magiceden.io which is both same-origin and legit-listed → no flag.
+    const originHost = msg.origin ? hostnameOf(msg.origin) : null;
+    const suspicious: string[] = [];
+    for (const u of urls) {
+      const host = hostnameOf(u);
+      if (!host) {
+        suspicious.push(u);
+        continue;
+      }
+      const sameOrigin =
+        originHost &&
+        (host === originHost ||
+          host.endsWith('.' + originHost) ||
+          originHost.endsWith('.' + host));
+      if (sameOrigin) continue;
+      if (isLegitHost(host)) continue;
+      suspicious.push(u);
+    }
+    if (suspicious.length === 0) return [];
+
     return [
       {
         ruleId: 'url-in-message',
         severity: 'medium',
-        message:
-          'Message contains one or more URLs. Verify every link carefully — phishing often disguises links as sign-in greetings.',
-        details: { urls: urls.slice(0, 5) },
+        message: `Message links to ${suspicious.length} non-allowlisted URL(s) outside the requesting site. Phishing payloads often hide links here.`,
+        details: { urls: suspicious.slice(0, 5), originHost: originHost ?? '(unknown)' },
       },
     ];
   },
@@ -188,7 +229,7 @@ export const spoofedSiwsDomain: MessageRule = {
     if (!claimedDomainRaw) return [];
     // strip protocol / trailing punctuation if present
     const claimedDomain = claimedDomainRaw.replace(/^https?:\/\//, '').replace(/[\/:].*$/, '').replace(/[.,;:]+$/, '');
-    const originHost = hostnameOf(msg.origin);
+    const originHost = msg.origin ? hostnameOf(msg.origin) : null;
     if (!originHost || !claimedDomain) return [];
     if (claimedDomain === originHost) return [];
     // also accept subdomain relationship (origin = app.foo.com, claim = foo.com or vice-versa)

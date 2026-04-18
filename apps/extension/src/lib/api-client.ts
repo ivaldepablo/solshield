@@ -122,7 +122,10 @@ export async function inspectTx(txBase64: string): Promise<VerdictView> {
       startedAt,
     };
   } catch (err) {
-    throw new Error(`inspect-tx failed: ${err instanceof Error ? err.message : String(err)}`);
+    // v0.4.9: fail-CLOSED on timeout/network too. Earlier we threw and the
+    // caller fell through to a "safe" failOpenVerdict — that's how Phantom
+    // popups appeared without our overlay on parallel signMessage exploits.
+    return syntheticSuspiciousVerdict('tx', startedAt, 0, 'server-error');
   }
 }
 
@@ -156,8 +159,8 @@ export async function inspectMessage(messageUtf8: string): Promise<VerdictView> 
       models: isSafe ? ['haiku 4.5'] : ['haiku 4.5', 'opus 4.7'],
       startedAt,
     };
-  } catch (err) {
-    throw new Error(`inspect-message failed: ${err instanceof Error ? err.message : String(err)}`);
+  } catch {
+    return syntheticSuspiciousVerdict('msg', startedAt, 0, 'server-error');
   }
 }
 
@@ -199,7 +202,7 @@ export async function checkDomain(url: string): Promise<VerdictView> {
       models: [],
       startedAt,
     };
-  } catch (err) {
-    throw new Error(`check-domain failed: ${err instanceof Error ? err.message : String(err)}`);
+  } catch {
+    return syntheticSuspiciousVerdict('domain', startedAt, 0, 'server-error');
   }
 }

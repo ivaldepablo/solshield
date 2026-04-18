@@ -5,6 +5,7 @@ import {
   verdictFromScore,
   type ThreatReport,
 } from '@solshield/core';
+import { Analyzer } from '@solshield/ai';
 import { getClientIp, hashIp } from '@/lib/ip';
 import { checkRateLimit, rateLimitHeaders } from '@/lib/rate-limit';
 
@@ -92,14 +93,43 @@ export async function POST(req: Request) {
     const score = scoreFromFindings(findings);
     const verdict = verdictFromScore(score);
 
+    let summary =
+      verdict === 'safe'
+        ? 'No suspicious patterns found in message.'
+        : findings[0]?.message ?? 'Review before signing.';
+
+    // Cheapest AI path: Haiku 4.5 explainer fires ONLY when static rules
+    // already flagged the message as non-safe. Safe messages don't burn a
+    // single credit. Magic Eden's legit SIWS now passes the URL_IN_MESSAGE
+    // rule's allowlist (same-origin + legit-dapps) so it short-circuits to
+    // safe and never reaches Haiku — exactly what we want for cost control.
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (anthropicKey && verdict !== 'safe') {
+      try {
+        const analyzer = new Analyzer({
+          apiKey: anthropicKey,
+          triageModel: process.env.SOLSHIELD_TRIAGE_MODEL,
+        });
+        const explained = await analyzer.explainMessage({
+          decodedText,
+          rawByteLength: rawBytes.length,
+          origin: body.origin,
+          findings,
+          verdict,
+        });
+        if (explained) summary = explained;
+      } catch (aiErr) {
+        // AI explanation is best-effort — never break the response on a
+        // model failure. We already have the deterministic rule message.
+        console.warn('[inspect-message] AI explain failed:', (aiErr as Error).message);
+      }
+    }
+
     const report: ThreatReport = {
       verdict,
       score,
       findings,
-      summary:
-        verdict === 'safe'
-          ? 'No suspicious patterns found in message.'
-          : findings[0]?.message ?? 'Review before signing.',
+      summary,
       elapsedMs: Date.now() - started,
     };
 

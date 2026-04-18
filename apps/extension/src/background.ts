@@ -322,6 +322,130 @@ if (typeof chrome.notifications !== 'undefined' && chrome.notifications.onClosed
   });
 }
 
+// --------------------------------------------------------------------------
+// Layer 4 — popup window (focus-steal defense, ultimate visibility).
+//
+// Live debug on magiceden.io showed that even with the in-page overlay (raw
+// DOM), the OS toast notification, and the badge, the user was missing the
+// SolShield warning because Magic Eden's own "Sign" modal covered the in-page
+// overlay AND Phantom opened notification.html stealing tab focus. A separate
+// Chrome window can't be hidden by dapp DOM and isn't part of the tab
+// compositor — it's a real OS window that pops up with our warning text.
+//
+// The popup is INFORMATIONAL only. The actual REJECT/PROCEED decision still
+// happens via the in-page overlay (so the wallet wrapper resolves correctly).
+// The popup includes a CTA button "GO BACK TO THE DAPP TAB" that focuses the
+// originating tab so the user gets to the overlay quickly.
+//
+// We dedupe by tab id: only one popup per tab at a time. If a new warning
+// fires while the previous popup is open, we update the URL hash payload of
+// the existing window instead of opening another.
+// --------------------------------------------------------------------------
+interface ShowWarningPopupRequest {
+  type: 'show-warning-popup';
+  verdict: VerdictView;
+  hostname: string;
+  tabId?: number;
+}
+
+const popupWindowByTab = new Map<number, number>();
+let lastPopupTs = 0;
+const POPUP_COOLDOWN_MS = 1500;
+
+async function showWarningPopup(req: ShowWarningPopupRequest, sender: chrome.runtime.MessageSender): Promise<void> {
+  if (typeof chrome.windows === 'undefined' || typeof chrome.windows.create !== 'function') return;
+
+  // Don't fire for safe verdicts (defense in depth — caller should already
+  // not call us in that case).
+  if (req.verdict.verdict === 'safe') return;
+
+  // Cooldown to prevent two parallel signMessage calls from spawning two
+  // popups within milliseconds. The dedupe in provider-hook.getVerdict
+  // shoulds already handle this, but defense-in-depth.
+  const now = Date.now();
+  if (now - lastPopupTs < POPUP_COOLDOWN_MS) return;
+  lastPopupTs = now;
+
+  const tabId = req.tabId ?? sender.tab?.id ?? 0;
+
+  const payload = {
+    verdict: req.verdict.verdict,
+    score: req.verdict.score,
+    summary: req.verdict.summary,
+    hostname: req.hostname,
+    tabId,
+    findings: (req.verdict.findings ?? []).slice(0, 5).map((f) => ({
+      ruleId: f.ruleId,
+      severity: f.severity,
+      message: f.message,
+    })),
+  };
+  const hash = encodeURIComponent(JSON.stringify(payload));
+  const warningUrl = chrome.runtime.getURL('tabs/warning.html') + '#' + hash;
+
+  // If we already have a popup for this tab, update its URL instead of opening
+  // another window.
+  if (typeof tabId === 'number' && tabId > 0 && popupWindowByTab.has(tabId)) {
+    const winId = popupWindowByTab.get(tabId)!;
+    try {
+      const win = await chrome.windows.get(winId, { populate: true });
+      if (win && win.tabs && win.tabs[0]) {
+        await chrome.tabs.update(win.tabs[0].id!, { url: warningUrl });
+        await chrome.windows.update(winId, { focused: true });
+        return;
+      }
+    } catch {
+      popupWindowByTab.delete(tabId);
+    }
+  }
+
+  // Position CENTER-TOP of primary display, larger than the wallet popup
+  // so it visually dominates. Phantom's notification.html opens roughly
+  // top-right (~430x600); ours at center-top is unmissable and won't be
+  // hidden behind the wallet's popup.
+  const POPUP_W = 640;
+  const POPUP_H = 720;
+  let left = 200;
+  let top = 60;
+  try {
+    if (typeof chrome.system !== 'undefined' && chrome.system.display) {
+      const displays = await chrome.system.display.getInfo();
+      const primary = displays.find((d) => d.isPrimary) ?? displays[0];
+      if (primary) {
+        // Center horizontally on primary display.
+        left = primary.bounds.left + Math.max(0, Math.floor((primary.bounds.width - POPUP_W) / 2));
+        top = primary.bounds.top + 40;
+      }
+    }
+  } catch { /* ignore */ }
+
+  try {
+    const created = await chrome.windows.create({
+      url: warningUrl,
+      type: 'popup',
+      focused: true,
+      width: POPUP_W,
+      height: POPUP_H,
+      left,
+      top,
+    });
+    if (created?.id != null && typeof tabId === 'number' && tabId > 0) {
+      popupWindowByTab.set(tabId, created.id);
+    }
+  } catch {
+    // ignore — Layers 1/2/3 still cover the user.
+  }
+}
+
+// Cleanup popup → tab map when the popup window closes.
+if (typeof chrome.windows !== 'undefined' && chrome.windows.onRemoved) {
+  chrome.windows.onRemoved.addListener((windowId) => {
+    for (const [t, w] of popupWindowByTab) {
+      if (w === windowId) popupWindowByTab.delete(t);
+    }
+  });
+}
+
 // Listen for messages from content scripts
 chrome.runtime.onMessage.addListener(
   (
@@ -348,6 +472,19 @@ chrome.runtime.onMessage.addListener(
     if ((req as { type?: string }).type === 'clear-warning-badge') {
       const r = req as ClearWarningBadgeRequest;
       clearWarningBadge(r.tabId ?? sender.tab?.id);
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    // Layer 4 — popup window (focus-steal defense, ultimate visibility).
+    // Opens a separate Chrome browser window with our warning. Lives
+    // OUTSIDE the dapp page DOM so dapp modals (Magic Eden's "Sign"
+    // overlay) cannot hide it, and survives Phantom's notification.html
+    // tab stealing focus from the dapp tab. Pure information; the actual
+    // REJECT/PROCEED decision still happens on the in-page overlay.
+    if ((req as { type?: string }).type === 'show-warning-popup') {
+      const r = req as ShowWarningPopupRequest;
+      void showWarningPopup(r, sender);
       sendResponse({ ok: true });
       return false;
     }
