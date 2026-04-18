@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.3.1';
+const SOLSHIELD_VERSION = '0.4.0';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
@@ -943,6 +943,77 @@ function setupWalletStandardHook(): void {
  *   - github.com/TeamRaccoons/sherlock-wallet (Solana reference)
  * ────────────────────────────────────────────────────────────────── */
 
+/**
+ * v0.4.0 — third interception point: navigator.wallets.get()
+ *
+ * Dynamic SDK (used by Magic Eden, many others) caches the wallet reference
+ * at connect-time via @wallet-standard/app's getWallets().get(). If our
+ * wrap installed AFTER Dynamic's cache snapshot, Dynamic forever calls
+ * signMessage on the unwrapped original.
+ *
+ * Defensive measure: poll for navigator.wallets to appear, then wrap its
+ * `get` method so EVERY enumeration returns wrapped wallets. This catches
+ * any dapp that uses @wallet-standard/app even if we lost the register-wallet
+ * race.
+ */
+function setupNavigatorWalletsHook(): void {
+  let installed = false;
+  const tryInstall = (): void => {
+    if (installed) return;
+    const nav = navigator as unknown as {
+      wallets?: { get?: () => readonly WalletStandardWallet[]; push?: (...wallets: WalletStandardWallet[]) => unknown };
+    };
+    const reg = nav.wallets;
+    if (!reg || typeof reg.get !== 'function') return;
+    installed = true;
+
+    const origGet = reg.get.bind(reg);
+    reg.get = function (): readonly WalletStandardWallet[] {
+      try {
+        const wallets = origGet();
+        if (!Array.isArray(wallets)) return wallets;
+        return wallets.map((w) => {
+          try {
+            return wrapWalletWithProxy(w) as WalletStandardWallet;
+          } catch {
+            return w;
+          }
+        });
+      } catch (err) {
+        recordError('navigator-wallets:get', err);
+        return [];
+      }
+    };
+    logEvent('info', 'nav-wallets', 'wrapped navigator.wallets.get');
+
+    // Also wrap push() so any LATE-added wallets get wrapped
+    if (typeof reg.push === 'function') {
+      const origPush = reg.push.bind(reg);
+      reg.push = function (...wallets: WalletStandardWallet[]) {
+        const wrapped = wallets.map((w) => {
+          try {
+            return wrapWalletWithProxy(w) as WalletStandardWallet;
+          } catch {
+            return w;
+          }
+        });
+        return origPush(...wrapped);
+      };
+      logEvent('info', 'nav-wallets', 'wrapped navigator.wallets.push');
+    }
+  };
+
+  // Try now, then poll for 5 seconds since navigator.wallets appears late
+  // (after the wallet-standard library inits).
+  tryInstall();
+  let attempts = 0;
+  const id = setInterval(() => {
+    attempts++;
+    tryInstall();
+    if (installed || attempts >= 50) clearInterval(id);
+  }, 100);
+}
+
 function setupDispatchEventHijack(): void {
   const origDispatch = window.dispatchEvent.bind(window);
   try {
@@ -1283,8 +1354,12 @@ ensureStatus().hooks.postMessageInterceptor = false;
 // no-op on Phantom 2025+ because window.solana is non-configurable, but
 // it doesn't crash anymore (we don't use defineProperty on it).
 logEvent('info', 'boot', `SolShield v${SOLSHIELD_VERSION} loading on ${location.host}`);
-safeSync('init:dispatch-hijack', setupDispatchEventHijack, undefined);
+// Init order matters: install register-wallet capture-phase listener FIRST so
+// any synchronous register-wallet event during the dispatchEvent hijack setup
+// is caught. Then install dispatchEvent hijack. Then legacy provider patches.
 safeSync('init:wallet-standard', setupWalletStandardHook, undefined);
+safeSync('init:dispatch-hijack', setupDispatchEventHijack, undefined);
+safeSync('init:navigator-wallets', setupNavigatorWalletsHook, undefined);
 safeSync('init:legacy-providers', initProviderPatching, undefined);
 logEvent('info', 'boot', 'all hooks installed');
 

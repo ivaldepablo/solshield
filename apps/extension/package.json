@@ -1,7 +1,7 @@
 {
   "name": "@solshield/extension",
   "displayName": "SolShield — scan before you sign",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Open-source Solana wallet firewall. Blocks drainers, phishing and fake permits before you sign. Powered by Claude AI.",
   "author": "0xnullpavel",
   "homepage": "https://solshield.dev",
@@ -9,7 +9,7 @@
   "type": "module",
   "scripts": {
     "dev": "plasmo dev",
-    "build": "plasmo build",
+    "build": "plasmo build && node scripts/postbuild-static-main.mjs",
     "build:firefox": "plasmo build --target=firefox-mv2",
     "package": "plasmo package",
     "typecheck": "tsc --noEmit"
@@ -21,10 +21,13 @@
     "react-dom": "19.2.0"
   },
   "devDependencies": {
+    "@solana/web3.js": "^1.98.4",
     "@types/chrome": "0.1.22",
     "@types/node": "22.18.10",
     "@types/react": "19.2.8",
     "@types/react-dom": "19.2.3",
+    "bip39": "^3.1.0",
+    "bs58": "^6.0.0",
     "playwright": "^1.59.1",
     "typescript": "5.9.3"
   },
