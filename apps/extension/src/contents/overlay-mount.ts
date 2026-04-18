@@ -201,16 +201,40 @@ window.addEventListener(
   'message',
   (event) => {
     if (event.source !== window) return;
-    const data = event.data as InpageRequest | undefined;
+    const data = event.data as
+      | (InpageRequest & { __solshield_show_overlay?: undefined })
+      | { __solshield_show_overlay: true; id: string; verdict: VerdictView; kind: VerdictView['kind'] }
+      | undefined;
+    if (!data || typeof data !== 'object') return;
+
+    // New v0.3.1 path: provider-hook fetched verdict directly and just wants
+    // us to show the overlay.
+    if ((data as { __solshield_show_overlay?: boolean }).__solshield_show_overlay === true) {
+      const showReq = data as {
+        __solshield_show_overlay: true;
+        id: string;
+        verdict: VerdictView;
+        kind: VerdictView['kind'];
+      };
+      void (async () => {
+        try {
+          const decision = await showOverlayAndAwaitDecision(showReq.verdict);
+          window.postMessage({ id: showReq.id, decision }, '*');
+        } catch {
+          window.postMessage({ id: showReq.id, decision: 'reject' as const }, '*');
+        }
+      })();
+      return;
+    }
+
+    // Legacy path (still supported as fallback for any provider-hook < 0.3.1).
     if (
-      !data ||
-      typeof data !== 'object' ||
       !('type' in data) ||
       (data.type !== 'analyze-tx' && data.type !== 'analyze-message')
     ) {
       return;
     }
-    void handleInpageRequest(data);
+    void handleInpageRequest(data as InpageRequest);
   },
   false,
 );

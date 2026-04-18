@@ -22,7 +22,7 @@ export const config: PlasmoCSConfig = {
   run_at: 'document_start',
 };
 
-const SOLSHIELD_VERSION = '0.3.0';
+const SOLSHIELD_VERSION = '0.3.1';
 const VERDICT_TIMEOUT_MS = 15_000;
 
 /**
@@ -1023,83 +1023,141 @@ function wrapSigningInvocation(
     logEvent('info', 'intercept', `${featureName} called`);
     try {
       const first = inputs[0] as Record<string, unknown> | undefined;
-      if (first) {
-        if (intent === 'msg') {
-          const message = (first.message as Uint8Array | undefined) ?? siwsInputToBytes(first);
-          if (message instanceof Uint8Array) {
-            const preview = serializeMessage(message).slice(0, 80);
-            logEvent('info', 'analyze-msg', preview);
-            const requestId = newId();
-            window.postMessage(
-              {
-                type: 'analyze-message',
-                id: requestId,
-                data: { message: serializeMessage(message) },
-              } as InpageRequest,
-              '*',
-            );
-            logEvent('info', 'await-verdict', `requestId=${requestId} waiting…`);
-            const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
-            logEvent('info', 'await-verdict', `requestId=${requestId} resolved`);
-            const v = response.verdict?.verdict ?? 'unknown';
-            recordInterception(
-              featureName === 'solana:signIn' ? 'wallet-standard-signin' : 'wallet-standard-msg',
-              v as 'safe' | 'suspicious' | 'danger' | 'unknown',
-            );
-            logEvent('info', 'verdict', `msg → ${v}`);
-            if (response.verdict?.verdict !== 'safe') {
-              throw createRejectionError();
-            }
-          } else {
-            logEvent('warn', 'intercept', `${featureName}: no Uint8Array payload, passing through`);
-          }
-        } else {
-          const tx = first.transaction;
-          if (tx instanceof Uint8Array) {
-            logEvent('info', 'analyze-tx', `${tx.length} bytes`);
-            const requestId = newId();
-            window.postMessage(
-              {
-                type: 'analyze-tx',
-                id: requestId,
-                data: { tx: bytesToBase64(tx) },
-              } as InpageRequest,
-              '*',
-            );
-            const response = await waitForVerdict(requestId, VERDICT_TIMEOUT_MS);
-            const v = response.verdict?.verdict ?? 'unknown';
-            recordInterception(
-              'wallet-standard-tx',
-              v as 'safe' | 'suspicious' | 'danger' | 'unknown',
-            );
-            logEvent('info', 'verdict', `tx → ${v}`);
-            if (response.verdict?.verdict !== 'safe') {
-              throw createRejectionError();
-            }
-          } else {
-            logEvent('warn', 'intercept', `${featureName}: no Uint8Array tx, passing through`);
-          }
+      if (!first) return fn.apply(this, inputs);
+
+      // Get the verdict. Try DIRECT fetch first (MAIN world to solshield.dev
+      // — CORS allows it, no CSP on supported dapps). If that fails (CSP on
+      // some dapp, network), fall back to the postMessage → overlay-mount
+      // path. Either way we get a verdict or fail-open in <15s.
+      let verdict: { verdict: 'safe' | 'suspicious' | 'danger'; summary?: string } | null = null;
+      let verdictKind: 'msg' | 'tx' = intent;
+
+      if (intent === 'msg') {
+        const message = (first.message as Uint8Array | undefined) ?? siwsInputToBytes(first);
+        if (!(message instanceof Uint8Array)) {
+          logEvent('warn', 'intercept', `${featureName}: no Uint8Array payload, passing through`);
+          return fn.apply(this, inputs);
         }
+        const text = serializeMessage(message);
+        logEvent('info', 'analyze-msg', text.slice(0, 80));
+        verdict = await getVerdict('inspect-message', { message: text, encoding: 'utf8' });
+      } else {
+        const tx = first.transaction;
+        if (!(tx instanceof Uint8Array)) {
+          logEvent('warn', 'intercept', `${featureName}: no Uint8Array tx, passing through`);
+          return fn.apply(this, inputs);
+        }
+        logEvent('info', 'analyze-tx', `${tx.length} bytes`);
+        verdict = await getVerdict('inspect', { tx: bytesToBase64(tx), encoding: 'base64' });
+        verdictKind = 'tx';
+      }
+
+      if (!verdict) {
+        // Both direct fetch AND postMessage fallback failed. Fail-open.
+        console.warn('[SolShield] all paths failed, failing open');
+        recordInterception(
+          verdictKind === 'tx' ? 'wallet-standard-tx' : 'wallet-standard-msg',
+          'failed-open',
+        );
+        logEvent('warn', 'fail-open', `${featureName}: no verdict from any path`);
+        return fn.apply(this, inputs);
+      }
+
+      recordInterception(
+        featureName === 'solana:signIn'
+          ? 'wallet-standard-signin'
+          : verdictKind === 'tx'
+            ? 'wallet-standard-tx'
+            : 'wallet-standard-msg',
+        verdict.verdict,
+      );
+      logEvent('info', 'verdict', `${verdictKind} → ${verdict.verdict}`);
+
+      if (verdict.verdict !== 'safe') {
+        // Show overlay via overlay-mount (postMessage). Wait for user.
+        // If overlay-mount is unreachable, default to reject (safer for
+        // suspicious calls).
+        const decision = await askUserViaOverlay(verdict, verdictKind);
+        if (decision === 'reject') throw createRejectionError();
       }
       return fn.apply(this, inputs);
     } catch (err) {
-      if (
-        err instanceof Error &&
-        (err.message.includes('Verdict timeout') || err.message.includes('offline'))
-      ) {
-        console.warn('[SolShield] wallet-standard offline, failed open');
-        recordInterception(
-          intent === 'tx' ? 'wallet-standard-tx' : 'wallet-standard-msg',
-          'failed-open',
-        );
-        logEvent('warn', 'fail-open', `${featureName}: ${err.message}`);
-        return fn.apply(this, inputs);
-      }
+      if (err instanceof Error && err.message === 'User rejected the request.') throw err;
       throw err;
     }
   };
   Object.defineProperty(wrapper, '__solshield_wrapped', { value: true });
   return wrapper;
+}
+
+/** Direct fetch to the SolShield API from MAIN world. Returns null on failure
+ *  (so caller can decide to fail-open). 8s timeout. */
+async function getVerdict(
+  endpoint: 'inspect-message' | 'inspect',
+  body: Record<string, unknown>,
+): Promise<{ verdict: 'safe' | 'suspicious' | 'danger'; summary?: string } | null> {
+  const url = `https://solshield.dev/api/${endpoint}`;
+  logEvent('info', 'verdict-fetch', `→ ${endpoint}`);
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      logEvent('warn', 'verdict-fetch', `HTTP ${res.status}`);
+      return null;
+    }
+    const data = (await res.json()) as { verdict: 'safe' | 'suspicious' | 'danger'; summary?: string };
+    logEvent('info', 'verdict-fetch', `← ${data.verdict}`);
+    return data;
+  } catch (err) {
+    logEvent('warn', 'verdict-fetch', `fail: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/** Show overlay via overlay-mount in ISOLATED world. Wait for user's click
+ *  back via postMessage. Returns 'proceed' or 'reject'. Defaults to reject
+ *  on timeout (safer for non-safe verdicts). */
+async function askUserViaOverlay(
+  verdictData: { verdict: 'safe' | 'suspicious' | 'danger'; summary?: string },
+  kind: 'msg' | 'tx',
+): Promise<'proceed' | 'reject'> {
+  const requestId = newId();
+  logEvent('info', 'overlay-ask', `${requestId.slice(-6)}`);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      logEvent('warn', 'overlay-ask', `${requestId.slice(-6)} timeout → reject`);
+      window.removeEventListener('message', listener);
+      resolve('reject');
+    }, 60_000);
+
+    const listener = (event: MessageEvent): void => {
+      if (event.source !== window) return;
+      const data = event.data as { id?: string; decision?: 'proceed' | 'reject' } | undefined;
+      if (!data || data.id !== requestId || !data.decision) return;
+      clearTimeout(timer);
+      window.removeEventListener('message', listener);
+      logEvent('info', 'overlay-ask', `${requestId.slice(-6)} → ${data.decision}`);
+      resolve(data.decision);
+    };
+    window.addEventListener('message', listener);
+
+    window.postMessage(
+      {
+        __solshield_show_overlay: true,
+        id: requestId,
+        verdict: verdictData,
+        kind,
+      },
+      '*',
+    );
+  });
 }
 
 /**
