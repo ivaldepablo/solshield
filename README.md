@@ -1,84 +1,145 @@
 # SolShield
 
-Pre-signature transaction analysis for Solana. Intercepts unsigned transactions, decides if they are safe to sign, and surfaces a verdict the wallet can render before the user approves.
+Una extensión de Chrome que mira lo que tu wallet va a firmar y te avisa si parece estafa. Antes de que toques "Confirmar".
 
-Blockaid and Blowfish already occupy this space. Both are closed, pay-walled, and scoped to what their vendors choose to cover. SolShield is the open reference implementation the ecosystem should have shipped two years ago.
+Funciona con Phantom, Solflare, Backpack, Glow, Trust y Coin98.
 
-> Active development. Not production-ready. Public APIs and data schemas will break until 1.0.
+![overlay bloqueando un drainer](screenshots/01-overlay-suspicious.png)
 
-## Threat model
+## Por qué hice esto
 
-The wallet layer on Solana is thin. When the user clicks *approve*, the signature authorizes the requested operation with almost no in-context explanation. SolShield sits between the dApp and the signature, takes the serialized transaction, and answers a single question: **is this safe to sign?**
+Llevo un año en Solana y ya he visto de todo. Un amigo perdió como mil quinientos dólares firmando un mensaje de "Sign in" en una página falsa de Magic Eden. El mensaje en realidad no era un login, era un permit para que un drainer le moviera todos los tokens. Otro firmó algo "para reclamar un airdrop" y al día siguiente no tenía SOL.
 
-Inspection runs in four passes, cheap to expensive:
+Existen Blockaid y Blowfish que hacen algo parecido y son buenos. El problema es que son cerrados, son pagos, y solo te enteras de cómo funcionan si firmás un contrato comercial con ellos. Yo quería algo donde pudiera ver cada regla y cada prompt. Algo que cualquiera pudiera correr en su propio servidor sin pedir permiso.
 
-1. **Static analysis.** Instruction decoding, known-bad program IDs, unlimited-approval anti-patterns, silent mint/freeze authority swaps, squatted token metadata, CPI guard violations.
-2. **Dynamic simulation.** Execute against forked mainnet state. Diff balances, token ownership, and account authorities. Catch hidden transfers and delegated authority the static pass missed.
-3. **Heuristic and ML classification.** Claude Haiku 4.5 for triage, Claude Opus 4.7 for deep reasoning on ambiguous cases. Prompts, few-shots, and the curated threat corpus all live in-tree — nothing is hidden in a remote config.
-4. **Reputation.** Program, signer, and destination history via Helius and on-chain feeds.
+Así que lo armé.
 
-The output is bounded: a numerical risk score, a categorical verdict (`safe | suspicious | danger`), and a human-readable reason ready to drop into a wallet modal.
+## Qué hace exactamente
 
-## Attack surface it covers
+Cuando una página te pide firmar algo en tu wallet:
 
-- Drainer programs and their obfuscated variants
-- Malicious token approvals and unlimited delegations
-- Hidden SOL/SPL transfers camouflaged inside legitimate-looking instructions
-- Authority swaps (mint, freeze, upgrade)
-- Squatted token metadata impersonating reputable mints
-- Compromised IDL payloads served through dApp frontends
-- Suspicious program deployments masquerading as known protocols
+1. SolShield se mete entre la página y tu wallet, y agarra la solicitud antes de que tu wallet la vea.
+2. Le pasa los bytes a Claude (sí, el de Anthropic) más 23 reglas escritas a mano que detectan patrones típicos de drainers.
+3. Te muestra un cartel con el resultado en lenguaje normal: "esto es seguro", "ojo, esto huele raro", o "no firmes esto, te van a vaciar la wallet".
+4. Vos decidís. Si decís que no, tu wallet ni se entera de que alguien intentó.
 
-What it deliberately does **not** do: trade execution guidance, price-impact warnings, MEV routing. Different tool, different problem.
+Se ve así cuando algo es sospechoso:
 
-## Repository layout
+![overlay con verdict suspicious y explicación](screenshots/01-overlay-suspicious.png)
+
+Si clickeás "REJECT", la transacción se cancela ahí mismo. Phantom o Solflare ni siquiera abren su popup pidiéndote confirmación:
+
+![overlay después de rechazar](screenshots/02-overlay-rejected.png)
+
+## Un ejemplo concreto para que se entienda
+
+Imaginá que entrás a una página que parece Magic Eden pero en realidad es `magiceden-airdrop.fake`. Te pide que firmes un mensaje que dice algo así:
 
 ```
-packages/core   Rule engine, instruction parser, policy types
-packages/ai     Anthropic-backed analysis layer (Haiku + Opus)
-packages/sdk    Client library for wallets and dApps
-apps/web        Dashboard, live demo, public threat feed
+phishing.com wants you to sign in with your Solana account:
+
+Welcome! Sign to verify ownership.
 ```
 
-Strict TypeScript, pnpm workspaces, `@solana/kit` (not the retired web3.js v1), Prisma + Postgres, Redis. Docker Compose for local development, the same containers in production.
+A primera vista parece un login normal. Pero ese mensaje, una vez firmado, le da al atacante una firma criptográfica que puede usar en otra página. Es lo que se llama "spoofed SIWS domain" — el mensaje dice ser de un dominio (`phishing.com`) pero la página que lo pide es otra (`magiceden-airdrop.fake`).
 
-## Running locally
+SolShield ve que el dominio del mensaje no coincide con dónde estás y lo marca como peligro nivel 90/100. Claude te explica en una frase:
 
-Prereqs: Node 22+, pnpm 10+, Docker.
+> "Este mensaje dice ser de phishing.com pero te lo está pidiendo magiceden-airdrop.fake — un ataque clásico de suplantación de dominio. Si firmás, podrían usar tu identidad o vaciar tu wallet."
+
+Y listo. Vos clickeás Reject y nunca pasó nada.
+
+## Cómo se ve en magiceden de verdad
+
+Esto es una sesión real con la extensión instalada, navegando a Magic Eden auténtico:
+
+![magiceden con SolShield](screenshots/03-magiceden-blocked.png)
+
+Cuando Magic Eden te pide firmar el SIWS para login (que es legítimo), SolShield revisa el mensaje, lo marca como `safe`, y no muestra nada. No te molesta cuando todo está bien. Si el mensaje en cambio tuviera un dominio raro o un patrón de permit con cantidades, ahí sí te frenaría.
+
+## Y para cuando el wallet abre su popup gigante
+
+Phantom abre una pestaña entera ocupando toda la pantalla cuando le pedís confirmar. Si nuestro cartel quedara escondido detrás, no servíamos para nada. Por eso SolShield abre TAMBIÉN una ventana del navegador separada, fuera del DOM de la página, para que la veas seguro:
+
+![ventana popup de SolShield](screenshots/04-popup-window.png)
+
+Esa ventana tiene un botón "VOLVER A LA PESTAÑA Y DECIDIR" que te lleva de vuelta donde está el overlay. Es defensa en cuatro capas: el cartel en la página, una notificación del sistema operativo, un punto rojo en el icono de la extensión, y esta ventana popup. Una de las cuatro siempre la ves, importa qué tan ocupado tengas Chrome.
+
+## La página
+
+`https://solshield.dev`
+
+![landing](screenshots/05-landing.png)
+
+## Cómo funciona por dentro
+
+Tres pedazos:
+
+**La extensión** (`apps/extension`)
+Lo que se instala en Chrome. Tiene dos scripts que se inyectan en cada página: uno se mete entre tu wallet y la página para interceptar las llamadas, y otro se encarga de mostrar los carteles. Hecha con React + Plasmo.
+
+**El servidor** (`apps/web`)
+Una API en Next.js que recibe la transacción o el mensaje, le pasa 23 reglas determinísticas (cosas tipo "este programa está en lista negra" o "este mensaje contiene una URL sospechosa"), y si algo se ve raro, le pregunta a Claude para que explique en lenguaje natural qué pasa. Está corriendo en un servidor mío en Hetzner.
+
+**Las reglas y los prompts** (`packages/core`, `packages/ai`)
+Archivos de texto cualquiera puede leer en GitHub. Si te parece que falta una regla o el prompt de Claude se puede mejorar, mandá un PR. Nada está oculto.
+
+## Por qué Claude
+
+Probé varios modelos. Claude Haiku 4.5 me da respuestas claras y cortas en menos de un segundo, y cuesta como $0.001 por análisis. Cuando una transacción es muy ambigua, escala a Claude Opus 4.7 que es más lento pero analiza instrucción por instrucción.
+
+Los créditos los pago yo. Por ahora cubrimos todo desde el servidor, no necesitas tu propia API key — instalas la extensión y listo. Si la cosa crece y se queda corto, ya veré. Si querés correrlo en tu propio servidor con tu key, también podés (`docker compose up`).
+
+## Instalación
+
+Por ahora no está en la Chrome Web Store (la voy a subir cuando esté más estable). Mientras tanto:
 
 ```bash
+git clone https://github.com/ivaldepablo/solshield
+cd solshield
 pnpm install
-cp .env.example .env    # HELIUS_API_KEY, ANTHROPIC_API_KEY
-docker compose up -d    # postgres + redis
-pnpm -F web dev
+pnpm -F @solshield/extension build
 ```
 
-## Roadmap
+Después en Chrome:
 
-- [x] Monorepo scaffold
-- [ ] Instruction decoder on top of `@solana/kit`
-- [ ] Static rule set — the top 20 drainer patterns at minimum
-- [ ] Forked-mainnet simulator with balance/ownership diffing
-- [ ] AI layer — Haiku 4.5 triage + Opus 4.7 deep reasoning
-- [ ] `@solshield/sdk` published to npm
-- [ ] Wallet integrations — Phantom, Solflare, Backpack
-- [ ] Public threat feed with signed, timestamped incidents
-- [ ] Third-party security audit before 1.0
+1. Andá a `chrome://extensions`
+2. Activá "Developer mode" arriba a la derecha
+3. Click en "Load unpacked"
+4. Seleccioná la carpeta `apps/extension/build/chrome-mv3-prod`
 
-## Security
+Ya deberías ver el icono de SolShield en la toolbar.
 
-SolShield is security-critical software. If you think you have found a vulnerability, do **not** open a public issue. Read [`SECURITY.md`](./SECURITY.md) for the disclosure path.
+## Wallets que funcionan
 
-Nothing here is a substitute for reviewing transactions yourself. SolShield reduces risk. It does not eliminate it.
+Probadas con cuentas reales en Solana mainnet:
 
-## Contributing
+- Phantom
+- Solflare
+- Backpack
+- Glow
+- Trust
+- Coin98
 
-[`CONTRIBUTING.md`](./CONTRIBUTING.md). Rule submissions are especially welcome — a new drainer pattern the same day it hits mainnet is worth more than any feature.
+También funciona con cualquier wallet que implemente el estándar wallet-standard.
 
-## License
+## Lo que falta
 
-Apache 2.0. See [`LICENSE`](./LICENSE).
+Cosas pendientes que voy haciendo cuando tengo tiempo:
 
----
+- Subirla a la Chrome Web Store
+- Detectar tokens clonados de Pump.fun (cuando un token gradúa, hay una ventana de minutos donde alguien puede crear uno con el mismo nombre en Raydium para confundir y cazar gente que compra rápido)
+- Soporte para Firefox
+- Mejor UX cuando Phantom abre su pestaña full-screen y te roba el foco
+- Más reglas a medida que aparezcan drainers nuevos
 
-Maintained by [@0xnullpavel](https://github.com/0xnullpavel). Reachable through GitHub issues or `security@solshield.dev` for sensitive reports.
+Si tenés ideas, abrí un issue. Si encontrás un bypass — que SolShield no detecte algo malicioso que debería — eso es lo más útil que podés reportar.
+
+## Contacto
+
+- Mail: hi@solshield.dev
+- GitHub: [@ivaldepablo](https://github.com/ivaldepablo)
+
+## Licencia
+
+MIT. Hacé lo que quieras con esto, fork it, mejoralo, vendelo. Solo no te hagas pasar por mí.
